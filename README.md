@@ -30,11 +30,6 @@ OMISE_PUBLIC_KEY=pkey_test_xxx
 OMISE_SECRET_KEY=skey_test_xxx
 \`\`\`
 
-### 3. Run Locally
-\`\`\`bash
-# Install dependencies
-npm install  # or pip install, go run, etc.
+## 📄 License
 
-# Start the application
-npm start
-\`\`\`
+BSD 2-Clause — see [LICENSE](LICENSE).
