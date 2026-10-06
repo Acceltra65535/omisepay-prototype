@@ -153,6 +153,42 @@ const chargeApi = (): MiddlewareHandler => {
       });
     }
 
+    // ──────────────────────────────────────────────────
+    // POST /api/applepay/validate-merchant
+    // ──────────────────────────────────────────────────
+    if (c.req.path === '/api/applepay/validate-merchant' && c.req.method === 'POST') {
+      try {
+        const body = await c.req.json();
+        const { validationUrl } = body;
+        if (!validationUrl) {
+          return c.json({ error: 'Missing validationUrl' }, 400);
+        }
+        
+        // In a real production scenario, this endpoint should contact Apple's validationUrl
+        // using your Apple Merchant Identity Certificate to retrieve a merchant session.
+        // For Omise, they might provide a specific endpoint to proxy this, or you use your own cert.
+        // If you are using Omise's managed Apple Pay, they often handle this via Omise.js.
+        // For this prototype, we'll try calling Omise's generic domains or return a mock session if in dev,
+        // but typically you must use your merchant cert.
+        // Reference: https://developer.apple.com/documentation/apple_pay_on_the_web/apple_pay_js_api/requesting_an_apple_pay_payment_session
+        
+        console.warn('Apple Pay merchant validation requires a Merchant Identity Certificate. Ensure your backend is configured to call Apple servers with the cert.');
+        
+        // This is a stub for Apple Pay merchant validation.
+        // To make it fully functional, implement HTTPS POST to validationUrl with the Apple Merchant Cert.
+        return c.json({
+          merchantSessionIdentifier: 'mock_session_id',
+          nonce: 'mock_nonce',
+          merchantIdentifier: 'merchant.com.omisepay',
+          domainName: 'omisepay.example.com',
+          displayName: 'Omise Pay',
+          signature: 'mock_signature'
+        });
+      } catch (err: any) {
+        return c.json({ error: err.message }, 500);
+      }
+    }
+
     // ──────────────────────────────────────────
     // POST /api/charge — Create charge with 3DS
     // ──────────────────────────────────────────
@@ -180,6 +216,7 @@ const chargeApi = (): MiddlewareHandler => {
           customer,
           invoice,
           billing,
+          is_apple_pay,
         } = body;
 
         // Input validations
@@ -229,12 +266,11 @@ const chargeApi = (): MiddlewareHandler => {
 
         const customerEmail = customer?.email ? String(customer.email).trim() : '';
         const customerName = customer?.name ? String(customer.name).trim() : '';
-        const customerPhone = customer?.phone ? String(customer.phone).trim() : '';
         const customerCompany = customer?.company ? String(customer.company).trim() : '';
         const invoiceNumber = invoice?.invoice_number ? String(invoice.invoice_number).trim() : '';
         const invoiceDesc = invoice?.description ? String(invoice.description).trim() : (invoiceNumber ? `Invoice #${invoiceNumber}` : 'Credit Card Payment');
 
-        if (customerEmail) {
+        if (customerEmail && !is_apple_pay) {
           try {
             const customerDescParts = [
               customerName,
@@ -254,7 +290,6 @@ const chargeApi = (): MiddlewareHandler => {
                 description: customerDesc,
                 card: token,
                 metadata: {
-                  phone: customerPhone,
                   name: customerName,
                   company: customerCompany,
                   invoice_number: invoiceNumber,
@@ -299,7 +334,6 @@ const chargeApi = (): MiddlewareHandler => {
             invoice_memo: invoice?.memo || '',
             customer_id: customerId || '',
             customer_email: customerEmail,
-            customer_phone: customerPhone,
             customer_name: customerName,
             customer_company: customerCompany,
             billing_country: billing?.country || '',
@@ -411,7 +445,6 @@ const chargeApi = (): MiddlewareHandler => {
           customer: customerEmail ? {
             email: customerEmail,
             name: customerName || null,
-            phone: customerPhone || null,
             company: customerCompany || null,
           } : null,
           card: chargeData.card

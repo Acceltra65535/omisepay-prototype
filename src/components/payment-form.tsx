@@ -167,7 +167,6 @@ export const PaymentForm = () => {
   const [invoiceNumber, setInvoiceNumber] = useState(() => `INV-2026-${Math.floor(1000 + Math.random() * 9000)}`);
   const [invoiceDescription, setInvoiceDescription] = useState('Professional Consulting Services');
   const [customerEmail, setCustomerEmail] = useState('');
-  const [customerPhone, setCustomerPhone] = useState('');
   const [customerCompany, setCustomerCompany] = useState('');
 
   // Payment Amount
@@ -195,7 +194,15 @@ export const PaymentForm = () => {
   const [omiseLoaded, setOmiseLoaded] = useState(false);
   const [isConfigured, setIsConfigured] = useState<boolean | null>(null);
   const [isLive, setIsLive] = useState(false);
+  const [isApplePayAvailable, setIsApplePayAvailable] = useState(false);
   const scriptLoaded = useRef(false);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && (window as any).ApplePaySession) {
+      const isAvailable = (window as any).ApplePaySession.canMakePayments();
+      setIsApplePayAvailable(isAvailable);
+    }
+  }, []);
 
   // Active country config
   const countryConfig: CountryConfig = useMemo(() => {
@@ -337,10 +344,6 @@ export const PaymentForm = () => {
     setCountry(newCountryCode);
     setState('');
     setPostalCode('');
-    // Auto prefix phone if empty
-    if (!customerPhone) {
-      setCustomerPhone(getCountryDialCode(newCountryCode) + ' ');
-    }
     setFieldErrors((prev) => {
       const next = { ...prev };
       delete next.country;
@@ -390,14 +393,6 @@ export const PaymentForm = () => {
       errors.customerEmail = 'Customer email is required for payment receipt & bank authorization';
     } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail.trim())) {
       errors.customerEmail = 'Please enter a valid email address';
-    }
-
-    // Phone is required for US cards or amounts >= S$500 for US FinCEN & 3DS Risk Evaluation
-    const phoneDigits = customerPhone.replace(/\D/g, '');
-    if ((country === 'US' || isHighValue) && !customerPhone.trim()) {
-      errors.customerPhone = 'Phone number is required by US banks for high-value fraud screening & 3DS verification';
-    } else if (customerPhone.trim() && phoneDigits.length < 7) {
-      errors.customerPhone = 'Please enter a valid phone number with area code (at least 7 digits)';
     }
 
     if (!invoiceNumber.trim()) {
@@ -474,7 +469,6 @@ export const PaymentForm = () => {
   }, [
     amount,
     customerEmail,
-    customerPhone,
     country,
     isHighValue,
     invoiceNumber,
@@ -490,6 +484,123 @@ export const PaymentForm = () => {
     postalCode,
     countryConfig,
   ]);
+
+  // ── Apple Pay Flow ─────────────────────────────────────────
+
+  const handleApplePay = async () => {
+    setError('');
+    const amt = parseFloat(amount);
+    if (isNaN(amt) || amt < 1.0) {
+      setError('Please enter a valid amount (Minimum S$1.00) before using Apple Pay.');
+      return;
+    }
+
+    const request = {
+      countryCode: 'SG',
+      currencyCode: 'SGD',
+      supportedNetworks: ['visa', 'masterCard', 'amex', 'discover'],
+      merchantCapabilities: ['supports3DS'],
+      total: { label: 'Omise Pay', amount: amt.toFixed(2) },
+    };
+
+    try {
+      const session = new (window as any).ApplePaySession(3, request);
+      
+      session.onvalidatemerchant = async (event: any) => {
+        try {
+          const res = await fetch('/api/applepay/validate-merchant', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ validationUrl: event.validationURL }),
+          });
+          const merchantSession = await res.json();
+          if (!res.ok) throw new Error(merchantSession.error || 'Merchant validation failed');
+          session.completeMerchantValidation(merchantSession);
+        } catch (err: any) {
+          console.error('Apple Pay Merchant Validation Error:', err);
+          session.abort();
+          setError('Apple Pay is not properly configured on this environment (Merchant Validation Failed).');
+        }
+      };
+
+      session.onpaymentauthorized = async (event: any) => {
+        try {
+          setStatus('tokenizing');
+          
+          // Tokenize Apple Pay with Omise
+          const token = await new Promise<string>((resolve, reject) => {
+            window.Omise.createToken(
+              'applepay',
+              event.payment.token.paymentData,
+              (statusCode: number, response: any) => {
+                if (statusCode === 200) {
+                  resolve(response.id);
+                } else {
+                  reject(new Error(response.message || 'Apple Pay tokenization failed'));
+                }
+              }
+            );
+          });
+
+          setStatus('charging');
+          const amountInCents = Math.round(amt * 100);
+          const clientRef = 'om_ref_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+          const returnUri = window.location.origin + window.location.pathname + '?ref=' + clientRef;
+
+          const chargeResponse = await fetch('/api/charge', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              token,
+              amount: amountInCents,
+              currency: 'sgd',
+              return_uri: returnUri,
+              client_ref: clientRef,
+              is_apple_pay: true,
+              customer: customerEmail ? { email: customerEmail } : undefined,
+              invoice: {
+                invoice_number: invoiceNumber.trim() || undefined,
+                description: invoiceDescription.trim() || undefined,
+              },
+            }),
+          });
+
+          const chargeData = await chargeResponse.json();
+          if (!chargeResponse.ok) {
+            throw new Error((chargeData as any).error || 'Payment processing failed');
+          }
+
+          if (chargeData.authorize_uri) {
+            window.sessionStorage.setItem('omise_last_charge_id', chargeData.id);
+            window.location.href = chargeData.authorize_uri;
+            return;
+          }
+
+          session.completePayment({ status: (window as any).ApplePaySession.STATUS_SUCCESS });
+          setChargeResult(chargeData);
+          if (chargeData.status === 'successful') {
+            setStatus('success');
+          } else if (chargeData.status === 'failed') {
+            setStatus('failed');
+            setError(chargeData.failure_message || 'Payment failed');
+          } else {
+            setStatus('verifying');
+            setTimeout(() => verifyCharge(`/api/charge/${chargeData.id}`), 2000);
+          }
+        } catch (err: any) {
+          console.error('Apple Pay Error:', err);
+          session.completePayment({ status: (window as any).ApplePaySession.STATUS_FAILURE });
+          setError(err.message || 'Apple Pay transaction failed');
+          setStatus('failed');
+        }
+      };
+
+      session.begin();
+    } catch (err: any) {
+      console.error('Failed to start Apple Pay:', err);
+      setError('Apple Pay is not available on this device or browser.');
+    }
+  };
 
   // ── Submit Payment ─────────────────────────────────────────
 
@@ -552,9 +663,6 @@ export const PaymentForm = () => {
         if (normalizedAddress.postal_code) {
           tokenCardData.postal_code = normalizedAddress.postal_code;
         }
-        if (customerPhone.trim()) {
-          tokenCardData.phone_number = customerPhone.trim();
-        }
 
         const token = await new Promise<string>((resolve, reject) => {
           window.Omise.createToken(
@@ -597,7 +705,6 @@ export const PaymentForm = () => {
             customer: {
               email: customerEmail.trim(),
               name: name.trim(),
-              phone: customerPhone.trim() || undefined,
               company: customerCompany.trim() || undefined,
             },
             invoice: {
@@ -650,7 +757,6 @@ export const PaymentForm = () => {
       cvc,
       amount,
       customerEmail,
-      customerPhone,
       customerCompany,
       invoiceNumber,
       invoiceDescription,
@@ -674,7 +780,6 @@ export const PaymentForm = () => {
     setCvc('');
     setAmount('1500.00');
     setCustomerEmail('');
-    setCustomerPhone('');
     setCustomerCompany('');
     setCountry('US');
     setStreet1('');
@@ -963,6 +1068,30 @@ export const PaymentForm = () => {
           </div>
         )}
 
+        {isApplePayAvailable && (
+          <div className="mb-8">
+            <button
+              type="button"
+              onClick={handleApplePay}
+              disabled={isProcessing}
+              className="w-full flex items-center justify-center gap-2 rounded-xl bg-black px-4 py-3.5 font-bold text-white shadow-md transition-all hover:bg-slate-900 focus:outline-none focus:ring-4 focus:ring-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <svg viewBox="0 0 40 16" width="40" height="16" fill="currentColor">
+                <path d="M14.93,7.21c0-1.63,1.33-2.61,2.58-3.23c-0.8-1.17-2.06-1.57-2.91-1.6c-1.24-0.12-2.43,0.73-3.06,0.73c-0.64,0-1.62-0.71-2.65-0.69C7.45,2.44,6.13,3.25,5.34,4.61c-1.6,2.78-0.41,6.89,1.15,9.15c0.76,1.11,1.67,2.33,2.87,2.29c1.17-0.04,1.61-0.75,3.02-0.75c1.4,0,1.81,0.75,3.04,0.73c1.24-0.02,2.02-1.11,2.78-2.22c0.88-1.29,1.24-2.54,1.26-2.61C19.41,11.18,14.93,9.45,14.93,7.21 M11.83,1.6C12.48,0.81,12.91,0,12.8-1.02C11.9,1.06,10.66,1.52,9.97,2.32c-0.6,0.7-1.12,1.59-0.97,2.58C10.02,4.98,11.23,4.41,11.83,1.6 M27.86,4.67v8.9h2.3v-8.9H27.86 M24.3,9.12c0-2.31-1.87-4.18-4.18-4.18c-2.31,0-4.18,1.87-4.18,4.18c0,2.31,1.87,4.18,4.18,4.18C22.43,13.3,24.3,11.43,24.3,9.12 M22.25,9.12c0,1.18-0.95,2.13-2.13,2.13c-1.18,0-2.13-0.95-2.13-2.13c0-1.18,0.95-2.13,2.13-2.13C21.3,6.99,22.25,7.94,22.25,9.12 M39.06,8.74c0-0.79-0.64-1.43-1.43-1.43h-2.92v4.86c0,0.79,0.64,1.43,1.43,1.43c0.79,0,1.43-0.64,1.43-1.43V8.74z M36.14,9.37V6.01h1.49v3.36H36.14z M32.65,11.05V2.32h2.05v8.73H32.65" />
+              </svg>
+              Pay with Apple Pay
+            </button>
+            <div className="relative mt-6">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-slate-200"></div>
+              </div>
+              <div className="relative flex justify-center text-sm">
+                <span className="bg-white px-3 text-slate-500 font-medium">Or pay with credit card</span>
+              </div>
+            </div>
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="space-y-5">
           {/* Amount Field */}
           <div>
@@ -1051,36 +1180,6 @@ export const PaymentForm = () => {
                   <p className="mt-1 text-xs text-red-500">{fieldErrors.customerEmail}</p>
                 ) : (
                   <p className="mt-1 text-xs text-slate-400">For invoice receipt & bank 3DS</p>
-                )}
-              </div>
-
-              <div>
-                <label htmlFor="customer_phone" className="mb-1.5 block text-sm font-medium text-slate-700">
-                  Phone Number {country === 'US' && <span className="text-red-500">*</span>}
-                </label>
-                <input
-                  id="customer_phone"
-                  type="tel"
-                  value={customerPhone}
-                  onChange={(e) => {
-                    setCustomerPhone(e.target.value);
-                    if (fieldErrors.customerPhone) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.customerPhone;
-                        return next;
-                      });
-                    }
-                  }}
-                  className={getInputClass('customerPhone')}
-                  placeholder="+1 (555) 000-0000"
-                  autoComplete="tel"
-                  disabled={isProcessing}
-                />
-                {fieldErrors.customerPhone ? (
-                  <p className="mt-1 text-xs text-red-500">{fieldErrors.customerPhone}</p>
-                ) : (
-                  <p className="mt-1 text-xs text-slate-400">Required by US banks for fraud check</p>
                 )}
               </div>
             </div>
