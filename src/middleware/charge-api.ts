@@ -345,12 +345,22 @@ const chargeApi = (): MiddlewareHandler => {
           const statusCode = (
             chargeResponse.status === 200 ? 400 : chargeResponse.status
           ) as ContentfulStatusCode;
+
+          let rawErrorMessage =
+            chargeData.message ||
+            chargeData.location ||
+            'Charge creation failed';
+
+          if (
+            typeof rawErrorMessage === 'string' &&
+            /amount must be less than or equal to/i.test(rawErrorMessage)
+          ) {
+            rawErrorMessage = `${rawErrorMessage} (这是 Omise 对新开通 Live 账户默认的风控限额。如需提升至 S$20,000.00，请联系 Omise 客服 support@omise.co 申请提高单笔支付上限)`;
+          }
+
           return c.json(
             {
-              error:
-                chargeData.message ||
-                chargeData.location ||
-                'Charge creation failed',
+              error: rawErrorMessage,
               code: chargeData.code || 'charge_failed',
             },
             statusCode,
