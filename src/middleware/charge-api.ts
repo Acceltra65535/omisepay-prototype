@@ -406,10 +406,10 @@ const chargeApi = (): MiddlewareHandler => {
           } : null,
           card: chargeData.card
             ? {
-                last_digits: chargeData.card.last_digits,
-                brand: chargeData.card.brand,
-                name: chargeData.card.name,
-              }
+              last_digits: chargeData.card.last_digits,
+              brand: chargeData.card.brand,
+              name: chargeData.card.name,
+            }
             : null,
           created_at: chargeData.created_at,
         });
@@ -475,10 +475,10 @@ const chargeApi = (): MiddlewareHandler => {
           } : null,
           card: chargeData.card
             ? {
-                last_digits: chargeData.card.last_digits,
-                brand: chargeData.card.brand,
-                name: chargeData.card.name,
-              }
+              last_digits: chargeData.card.last_digits,
+              brand: chargeData.card.brand,
+              name: chargeData.card.name,
+            }
             : null,
           created_at: chargeData.created_at,
         });
@@ -556,10 +556,10 @@ const chargeApi = (): MiddlewareHandler => {
           } : null,
           card: chargeData.card
             ? {
-                last_digits: chargeData.card.last_digits,
-                brand: chargeData.card.brand,
-                name: chargeData.card.name,
-              }
+              last_digits: chargeData.card.last_digits,
+              brand: chargeData.card.brand,
+              name: chargeData.card.name,
+            }
             : null,
           created_at: chargeData.created_at,
         });
