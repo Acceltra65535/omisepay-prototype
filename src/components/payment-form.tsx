@@ -519,7 +519,8 @@ export const PaymentForm = () => {
         } catch (err: any) {
           console.error('Apple Pay Merchant Validation Error:', err);
           session.abort();
-          setError('Apple Pay is not properly configured on this environment (Merchant Validation Failed).');
+          setError(err.message || 'Apple Pay Merchant Validation Failed. 请在 .env 中配置 APPLE_MERCHANT_ID、APPLE_MERCHANT_CERT_PATH、APPLE_MERCHANT_KEY_PATH。');
+          setStatus('failed');
         }
       };
 

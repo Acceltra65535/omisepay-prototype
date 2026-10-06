@@ -155,37 +155,132 @@ const chargeApi = (): MiddlewareHandler => {
 
     // ──────────────────────────────────────────────────
     // POST /api/applepay/validate-merchant
+    // Apple Pay on the Web requires server-to-server
+    // mutual TLS with Apple using Merchant Identity
+    // Certificate + Private Key.
+    //
+    // Required env vars (or files):
+    //   APPLE_MERCHANT_ID          — e.g. "merchant.co.omise.xxx"
+    //   APPLE_MERCHANT_CERT_PATH   — path to .pem cert file
+    //   APPLE_MERCHANT_KEY_PATH    — path to .key private key file
+    //   APPLE_DISPLAY_NAME         — display name shown on Apple Pay sheet
+    //   APPLE_DOMAIN_NAME          — your verified domain (no https://)
     // ──────────────────────────────────────────────────
     if (c.req.path === '/api/applepay/validate-merchant' && c.req.method === 'POST') {
       try {
         const body = await c.req.json();
         const { validationUrl } = body;
-        if (!validationUrl) {
+        if (!validationUrl || typeof validationUrl !== 'string') {
           return c.json({ error: 'Missing validationUrl' }, 400);
         }
-        
-        // In a real production scenario, this endpoint should contact Apple's validationUrl
-        // using your Apple Merchant Identity Certificate to retrieve a merchant session.
-        // For Omise, they might provide a specific endpoint to proxy this, or you use your own cert.
-        // If you are using Omise's managed Apple Pay, they often handle this via Omise.js.
-        // For this prototype, we'll try calling Omise's generic domains or return a mock session if in dev,
-        // but typically you must use your merchant cert.
-        // Reference: https://developer.apple.com/documentation/apple_pay_on_the_web/apple_pay_js_api/requesting_an_apple_pay_payment_session
-        
-        console.warn('Apple Pay merchant validation requires a Merchant Identity Certificate. Ensure your backend is configured to call Apple servers with the cert.');
-        
-        // This is a stub for Apple Pay merchant validation.
-        // To make it fully functional, implement HTTPS POST to validationUrl with the Apple Merchant Cert.
-        return c.json({
-          merchantSessionIdentifier: 'mock_session_id',
-          nonce: 'mock_nonce',
-          merchantIdentifier: 'merchant.com.omisepay',
-          domainName: 'omisepay.example.com',
-          displayName: 'Omise Pay',
-          signature: 'mock_signature'
+
+        // Validate the URL is actually from Apple
+        const parsedUrl = new URL(validationUrl);
+        if (!parsedUrl.hostname.endsWith('.apple.com')) {
+          return c.json({ error: 'Invalid Apple validation URL' }, 400);
+        }
+
+        const merchantId = process.env.APPLE_MERCHANT_ID || '';
+        const certPath = process.env.APPLE_MERCHANT_CERT_PATH || '';
+        const keyPath = process.env.APPLE_MERCHANT_KEY_PATH || '';
+        const displayName = process.env.APPLE_DISPLAY_NAME || 'Omise Pay';
+        const domainName = process.env.APPLE_DOMAIN_NAME || '';
+
+        if (!merchantId || !certPath || !keyPath) {
+          console.error(
+            'Apple Pay Merchant Validation: Missing configuration.\n' +
+            'Please set the following environment variables in .env:\n' +
+            '  APPLE_MERCHANT_ID=merchant.co.omise.xxx\n' +
+            '  APPLE_MERCHANT_CERT_PATH=/path/to/merchant_id.pem\n' +
+            '  APPLE_MERCHANT_KEY_PATH=/path/to/merchant_id.key\n' +
+            '  APPLE_DISPLAY_NAME=Your Business Name\n' +
+            '  APPLE_DOMAIN_NAME=yourdomain.com\n' +
+            '\n' +
+            'These can be obtained from the Omise Dashboard under Apple Pay settings,\n' +
+            'or from your Apple Developer account at https://developer.apple.com\n'
+          );
+          return c.json(
+            {
+              error:
+                'Apple Pay 尚未配置。请在 Omise Dashboard 获取 Apple Pay Merchant Identity Certificate (.pem) 和 Private Key (.key)，' +
+                '然后在 .env 中设置 APPLE_MERCHANT_ID、APPLE_MERCHANT_CERT_PATH、APPLE_MERCHANT_KEY_PATH 环境变量。',
+              code: 'applepay_not_configured',
+            },
+            503,
+          );
+        }
+
+        // Read cert and key files
+        const fs = await import('fs');
+        let cert: string;
+        let key: string;
+        try {
+          cert = fs.readFileSync(certPath, 'utf-8');
+          key = fs.readFileSync(keyPath, 'utf-8');
+        } catch (fileErr: any) {
+          console.error('Apple Pay cert/key file read error:', fileErr.message);
+          return c.json(
+            {
+              error: `无法读取 Apple Pay 证书文件: ${fileErr.message}。请检查 APPLE_MERCHANT_CERT_PATH 和 APPLE_MERCHANT_KEY_PATH 路径是否正确。`,
+              code: 'applepay_cert_read_error',
+            },
+            500,
+          );
+        }
+
+        // Call Apple's validation URL with mutual TLS (client cert)
+        const https = await import('https');
+        const merchantSession = await new Promise<any>((resolve, reject) => {
+          const postData = JSON.stringify({
+            merchantIdentifier: merchantId,
+            displayName: displayName,
+            initiative: 'web',
+            initiativeContext: domainName,
+          });
+
+          const urlObj = new URL(validationUrl);
+          const options: Record<string, any> = {
+            hostname: urlObj.hostname,
+            port: 443,
+            path: urlObj.pathname,
+            method: 'POST',
+            cert: cert,
+            key: key,
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(postData),
+            },
+          };
+
+          const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk: string) => { data += chunk; });
+            res.on('end', () => {
+              try {
+                const parsed = JSON.parse(data);
+                if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+                  resolve(parsed);
+                } else {
+                  reject(new Error(`Apple validation failed (HTTP ${res.statusCode}): ${data}`));
+                }
+              } catch {
+                reject(new Error(`Apple validation returned invalid JSON: ${data}`));
+              }
+            });
+          });
+
+          req.on('error', (err: Error) => {
+            reject(new Error(`Apple Pay validation network error: ${err.message}`));
+          });
+
+          req.write(postData);
+          req.end();
         });
+
+        return c.json(merchantSession);
       } catch (err: any) {
-        return c.json({ error: err.message }, 500);
+        console.error('Apple Pay Merchant Validation Error:', err);
+        return c.json({ error: err.message || 'Merchant validation failed' }, 500);
       }
     }
 
