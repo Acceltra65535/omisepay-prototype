@@ -65,6 +65,37 @@ function getAuthHeader(secretKey: string): string {
 }
 
 /**
+ * Extract real client IP address from proxy headers (Cloudflare, Nginx, ALB)
+ * Essential for 3D Secure 2.0 ACS and Visa/Mastercard fraud risk scoring.
+ */
+function getClientIp(c: any): string {
+  const cfIp = c.req.header('cf-connecting-ip');
+  if (cfIp) return cfIp.trim();
+
+  const realIp = c.req.header('x-real-ip');
+  if (realIp) return realIp.trim();
+
+  const forwardedFor = c.req.header('x-forwarded-for');
+  if (forwardedFor) {
+    const firstIp = forwardedFor.split(',')[0]?.trim();
+    if (firstIp) return firstIp;
+  }
+
+  const trueClientIp = c.req.header('true-client-ip');
+  if (trueClientIp) return trueClientIp.trim();
+
+  return '';
+}
+
+function getClientUserAgent(c: any): string {
+  return c.req.header('user-agent')?.trim() || '';
+}
+
+function getClientAcceptLanguage(c: any): string {
+  return c.req.header('accept-language')?.trim() || '';
+}
+
+/**
  * In-memory map to store 3DS reference mappings (client_ref -> charge_id)
  * Keeps items for 1 hour to handle delayed 3DS returns.
  */
@@ -107,6 +138,8 @@ const chargeApi = (): MiddlewareHandler => {
       const isSecretReady = isSecretKeyReady(secretKey);
       const isLive = publicKey.startsWith('pkey_live_') || secretKey.startsWith('skey_live_');
 
+      const detectedIp = getClientIp(c);
+
       return c.json({
         publicKey: isPublicReady ? publicKey : '',
         currency: 'sgd',
@@ -116,6 +149,7 @@ const chargeApi = (): MiddlewareHandler => {
         isLive,
         minAmount: OMISE_CONFIG.minAmountSubunits,
         maxAmount: OMISE_CONFIG.maxAmountSubunits,
+        clientIp: detectedIp || null,
       });
     }
 
@@ -175,6 +209,16 @@ const chargeApi = (): MiddlewareHandler => {
         const finalCurrency = 'sgd';
 
         // ──────────────────────────────────────────────────────────
+        // Extract Cardholder IP & Browser Context (3DS 2.0 browserIP)
+        // Passing the real client IP is paramount for lowering fraud
+        // risk scores in Visa Advanced Authorization & Mastercard Decision
+        // Intelligence, matching IP geolocation with issuing bank country.
+        // ──────────────────────────────────────────────────────────
+        const clientIp = getClientIp(c) || (body.client_ip ? String(body.client_ip).trim() : '');
+        const userAgent = getClientUserAgent(c) || (body.user_agent ? String(body.user_agent).trim() : '');
+        const acceptLanguage = getClientAcceptLanguage(c);
+
+        // ──────────────────────────────────────────────────────────
         // Step 1: Create / Register Customer Entity in Omise
         // (Similar to Stripe Invoicing: binds card token to customer,
         // establishes customer identity & contact details to pass
@@ -214,6 +258,8 @@ const chargeApi = (): MiddlewareHandler => {
                   name: customerName,
                   company: customerCompany,
                   invoice_number: invoiceNumber,
+                  registration_ip: clientIp,
+                  user_agent: userAgent,
                   billing_country: billing?.country || '',
                   billing_state: billing?.state || '',
                   billing_city: billing?.city || '',
@@ -262,9 +308,17 @@ const chargeApi = (): MiddlewareHandler => {
             billing_postal_code: billing?.postal_code || '',
             billing_street: billing?.street1 || '',
             client_ref: client_ref || '',
+            client_ip: clientIp,
+            user_agent: userAgent,
+            accept_language: acceptLanguage,
             high_value_us_compliance: isUsOrHighValue,
           },
         };
+
+        // Pass cardholder IP directly to Omise API for bank fraud scoring
+        if (clientIp) {
+          chargePayload.ip = clientIp;
+        }
 
         if (customerId) {
           chargePayload.customer = customerId;
