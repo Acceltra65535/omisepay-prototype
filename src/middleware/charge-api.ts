@@ -71,6 +71,12 @@ function getAuthHeader(secretKey: string): string {
 interface PendingChargeEntry {
   chargeId: string;
   createdAt: number;
+  customerId?: string | undefined;
+  invoiceNumber?: string | undefined;
+  customerEmail?: string | undefined;
+  customerName?: string | undefined;
+  customerCompany?: string | undefined;
+  invoiceDescription?: string | undefined;
 }
 const pendingChargesMap = new Map<string, PendingChargeEntry>();
 
@@ -131,7 +137,16 @@ const chargeApi = (): MiddlewareHandler => {
 
       try {
         const body = await c.req.json();
-        const { token, amount, currency, return_uri, client_ref } = body;
+        const {
+          token,
+          amount,
+          currency,
+          return_uri,
+          client_ref,
+          customer,
+          invoice,
+          billing,
+        } = body;
 
         // Input validations
         if (!token || typeof token !== 'string') {
@@ -159,23 +174,115 @@ const chargeApi = (): MiddlewareHandler => {
         // Singapore Omise transactions strictly require SGD
         const finalCurrency = 'sgd';
 
-        // Build charge parameters
-        const chargeParams = new URLSearchParams({
-          amount: amount.toString(),
-          currency: finalCurrency,
-          card: token,
-          return_uri: return_uri,
-          capture: 'true',
-        });
+        // ──────────────────────────────────────────────────────────
+        // Step 1: Create / Register Customer Entity in Omise
+        // (Similar to Stripe Invoicing: binds card token to customer,
+        // establishes customer identity & contact details to pass
+        // US bank anti-fraud and 3DS risk evaluation)
+        // ──────────────────────────────────────────────────────────
+        let customerId: string | null = null;
+        let cardId: string | null = null;
 
-        // Request Omise API
+        const customerEmail = customer?.email ? String(customer.email).trim() : '';
+        const customerName = customer?.name ? String(customer.name).trim() : '';
+        const customerPhone = customer?.phone ? String(customer.phone).trim() : '';
+        const customerCompany = customer?.company ? String(customer.company).trim() : '';
+        const invoiceNumber = invoice?.invoice_number ? String(invoice.invoice_number).trim() : '';
+        const invoiceDesc = invoice?.description ? String(invoice.description).trim() : (invoiceNumber ? `Invoice #${invoiceNumber}` : 'Credit Card Payment');
+
+        if (customerEmail) {
+          try {
+            const customerDescParts = [
+              customerName,
+              customerCompany ? `(${customerCompany})` : '',
+              invoiceNumber ? `[${invoiceNumber}]` : '',
+            ].filter(Boolean);
+            const customerDesc = customerDescParts.length > 0 ? customerDescParts.join(' ') : `Customer ${customerEmail}`;
+
+            const customerResponse = await fetch('https://api.omise.co/customers', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: getAuthHeader(secretKey),
+              },
+              body: JSON.stringify({
+                email: customerEmail,
+                description: customerDesc,
+                card: token,
+                metadata: {
+                  phone: customerPhone,
+                  name: customerName,
+                  company: customerCompany,
+                  invoice_number: invoiceNumber,
+                  billing_country: billing?.country || '',
+                  billing_state: billing?.state || '',
+                  billing_city: billing?.city || '',
+                  billing_postal_code: billing?.postal_code || '',
+                  billing_street1: billing?.street1 || '',
+                },
+              }),
+            });
+
+            const customerData = await customerResponse.json();
+            if (customerResponse.ok && customerData.id) {
+              customerId = customerData.id;
+              if (customerData.default_card) {
+                cardId = customerData.default_card;
+              }
+            } else {
+              console.warn('Customer entity registration warning:', customerData.message || 'proceeding with direct token charge');
+            }
+          } catch (custErr) {
+            console.warn('Customer entity registration network warning:', custErr);
+          }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Step 2: Create Charge with Customer & Invoice Context
+        // ──────────────────────────────────────────────────────────
+        const isUsOrHighValue = (billing?.country === 'US') || (amount >= 100000);
+
+        const chargePayload: Record<string, any> = {
+          amount: amount,
+          currency: finalCurrency,
+          return_uri: return_uri,
+          capture: true,
+          description: invoiceDesc,
+          metadata: {
+            invoice_number: invoiceNumber,
+            invoice_memo: invoice?.memo || '',
+            customer_id: customerId || '',
+            customer_email: customerEmail,
+            customer_phone: customerPhone,
+            customer_name: customerName,
+            customer_company: customerCompany,
+            billing_country: billing?.country || '',
+            billing_state: billing?.state || '',
+            billing_city: billing?.city || '',
+            billing_postal_code: billing?.postal_code || '',
+            billing_street: billing?.street1 || '',
+            client_ref: client_ref || '',
+            high_value_us_compliance: isUsOrHighValue,
+          },
+        };
+
+        if (customerId) {
+          chargePayload.customer = customerId;
+          if (cardId) {
+            chargePayload.card = cardId;
+          }
+        } else {
+          chargePayload.card = token;
+        }
+
+        // Request Omise Charges API
         const chargeResponse = await fetch('https://api.omise.co/charges', {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Type': 'application/json',
             Authorization: getAuthHeader(secretKey),
           },
-          body: chargeParams,
+          body: JSON.stringify(chargePayload),
         });
 
         const chargeData = await chargeResponse.json();
@@ -200,12 +307,24 @@ const chargeApi = (): MiddlewareHandler => {
         if (client_ref && typeof client_ref === 'string') {
           pendingChargesMap.set(client_ref, {
             chargeId: chargeData.id,
+            customerId: customerId || undefined,
+            invoiceNumber: invoiceNumber || undefined,
+            customerEmail: customerEmail || undefined,
+            customerName: customerName || undefined,
+            customerCompany: customerCompany || undefined,
+            invoiceDescription: invoiceDesc || undefined,
             createdAt: Date.now(),
           });
         }
         if (chargeData.id) {
           pendingChargesMap.set(chargeData.id, {
             chargeId: chargeData.id,
+            customerId: customerId || undefined,
+            invoiceNumber: invoiceNumber || undefined,
+            customerEmail: customerEmail || undefined,
+            customerName: customerName || undefined,
+            customerCompany: customerCompany || undefined,
+            invoiceDescription: invoiceDesc || undefined,
             createdAt: Date.now(),
           });
         }
@@ -222,6 +341,15 @@ const chargeApi = (): MiddlewareHandler => {
           failure_code: chargeData.failure_code || null,
           failure_message: chargeData.failure_message || null,
           client_ref: client_ref || null,
+          customer_id: customerId || chargeData.customer || null,
+          invoice_number: invoiceNumber || (chargeData.metadata && chargeData.metadata.invoice_number) || null,
+          invoice_description: invoiceDesc,
+          customer: customerEmail ? {
+            email: customerEmail,
+            name: customerName || null,
+            phone: customerPhone || null,
+            company: customerCompany || null,
+          } : null,
           card: chargeData.card
             ? {
                 last_digits: chargeData.card.last_digits,
@@ -283,6 +411,14 @@ const chargeApi = (): MiddlewareHandler => {
           paid: chargeData.paid,
           failure_code: chargeData.failure_code || null,
           failure_message: chargeData.failure_message || null,
+          customer_id: entry.customerId || chargeData.customer || null,
+          invoice_number: entry.invoiceNumber || (chargeData.metadata && chargeData.metadata.invoice_number) || null,
+          invoice_description: entry.invoiceDescription || chargeData.description || null,
+          customer: entry.customerEmail || (chargeData.metadata && chargeData.metadata.customer_email) ? {
+            email: entry.customerEmail || chargeData.metadata?.customer_email,
+            name: entry.customerName || chargeData.metadata?.customer_name || null,
+            company: entry.customerCompany || chargeData.metadata?.customer_company || null,
+          } : null,
           card: chargeData.card
             ? {
                 last_digits: chargeData.card.last_digits,
@@ -355,6 +491,15 @@ const chargeApi = (): MiddlewareHandler => {
           paid: chargeData.paid,
           failure_code: chargeData.failure_code || null,
           failure_message: chargeData.failure_message || null,
+          customer_id: chargeData.customer || (chargeData.metadata && chargeData.metadata.customer_id) || null,
+          invoice_number: (chargeData.metadata && chargeData.metadata.invoice_number) || null,
+          invoice_description: chargeData.description || null,
+          customer: (chargeData.metadata && chargeData.metadata.customer_email) ? {
+            email: chargeData.metadata.customer_email,
+            name: chargeData.metadata.customer_name || null,
+            phone: chargeData.metadata.customer_phone || null,
+            company: chargeData.metadata.customer_company || null,
+          } : null,
           card: chargeData.card
             ? {
                 last_digits: chargeData.card.last_digits,
