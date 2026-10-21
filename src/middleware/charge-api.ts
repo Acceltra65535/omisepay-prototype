@@ -151,9 +151,14 @@ const chargeApi = (): MiddlewareHandler => {
       const detectedIp = getClientIp(c);
 
       const defaultCurrency = getDefaultCurrency();
+      // Apple Pay Merchant ID is not a secret (it is shown in the Apple Pay sheet and
+      // must be sent by the browser to Omise Vault as tokenization[merchant_id]).
+      const applePayMerchantId =
+        process.env.APPLE_MERCHANT_ID || readEnvFile().APPLE_MERCHANT_ID || '';
 
       return c.json({
         publicKey: isPublicReady ? publicKey : '',
+        applePayMerchantId,
         currency: defaultCurrency,
         defaultCurrency,
         supportedCurrencies: OMISE_CONFIG.supportedCurrencies,

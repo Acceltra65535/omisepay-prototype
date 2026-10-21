@@ -203,6 +203,7 @@ export const PaymentForm = () => {
   const [isApplePayAvailable, setIsApplePayAvailable] = useState(false);
   const scriptLoaded = useRef(false);
   const publicKeyRef = useRef('');
+  const applePayMerchantIdRef = useRef('');
 
   useEffect(() => {
     if (typeof window !== 'undefined' && (window as any).ApplePaySession) {
@@ -264,6 +265,9 @@ export const PaymentForm = () => {
         const config = await res.json();
         setIsConfigured(config.isConfigured);
         setIsLive(config.isLive);
+        if (config.applePayMerchantId) {
+          applePayMerchantIdRef.current = config.applePayMerchantId;
+        }
 
         if (config.defaultCurrency && ['sgd', 'usd', 'cad'].includes(config.defaultCurrency.toLowerCase())) {
           setCurrency(config.defaultCurrency.toLowerCase() as SupportedCurrency);
@@ -563,61 +567,46 @@ export const PaymentForm = () => {
         try {
           setStatus('tokenizing');
           
-          // Tokenize Apple Pay with Omise (tries Omise.js first, then Omise Vault API fallback)
-          const token = await new Promise<string>((resolve, reject) => {
-            const sendToVaultDirectly = async () => {
-              try {
-                const pk = publicKeyRef.current;
-                if (!pk) {
-                  return reject(new Error('Omise Public Key not loaded for Apple Pay'));
-                }
-                const formData = new URLSearchParams();
-                formData.append('tokenization[method]', 'applepay');
-                formData.append(
-                  'tokenization[data]',
-                  typeof event.payment.token.paymentData === 'string'
-                    ? event.payment.token.paymentData
-                    : JSON.stringify(event.payment.token.paymentData)
-                );
-                const vaultRes = await fetch('https://vault.omise.co/tokens', {
-                  method: 'POST',
-                  headers: {
-                    Authorization: 'Basic ' + btoa(pk + ':'),
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                  },
-                  body: formData.toString(),
-                });
-                const vaultData = await vaultRes.json();
-                if (vaultRes.ok && vaultData.id) {
-                  resolve(vaultData.id);
-                } else {
-                  reject(new Error(vaultData.message || 'Apple Pay tokenization failed'));
-                }
-              } catch (vaultErr: any) {
-                reject(new Error(vaultErr.message || 'Apple Pay tokenization network error'));
+          // Tokenize Apple Pay with Omise Vault.
+          // Omise requires tokenization[method], tokenization[data] and tokenization[merchant_id]
+          // (the Apple Pay Merchant ID registered with Omise, e.g. merchant.omise.sg.prod).
+          const token = await new Promise<string>(async (resolve, reject) => {
+            try {
+              const pk = publicKeyRef.current;
+              if (!pk) {
+                return reject(new Error('Omise Public Key not loaded for Apple Pay'));
               }
-            };
-
-            if (window.Omise && typeof window.Omise.createToken === 'function') {
-              try {
-                window.Omise.createToken(
-                  'applepay',
-                  event.payment.token.paymentData,
-                  (statusCode: number, response: any) => {
-                    if (statusCode === 200 && response?.id) {
-                      resolve(response.id);
-                    } else {
-                      sendToVaultDirectly();
-                    }
-                  }
+              const merchantId = applePayMerchantIdRef.current;
+              if (!merchantId) {
+                return reject(
+                  new Error('Apple Pay Merchant ID is not configured. 请在 .env 中设置 APPLE_MERCHANT_ID 并重启服务。'),
                 );
-                return;
-              } catch {
-                sendToVaultDirectly();
-                return;
               }
+              const paymentData = event.payment.token.paymentData;
+              const formData = new URLSearchParams();
+              formData.append('tokenization[method]', 'applepay');
+              formData.append('tokenization[merchant_id]', merchantId);
+              formData.append(
+                'tokenization[data]',
+                typeof paymentData === 'string' ? paymentData : JSON.stringify(paymentData),
+              );
+              const vaultRes = await fetch('https://vault.omise.co/tokens', {
+                method: 'POST',
+                headers: {
+                  Authorization: 'Basic ' + btoa(pk + ':'),
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: formData.toString(),
+              });
+              const vaultData = await vaultRes.json();
+              if (vaultRes.ok && vaultData.id) {
+                resolve(vaultData.id);
+              } else {
+                reject(new Error(vaultData.message || 'Apple Pay tokenization failed'));
+              }
+            } catch (vaultErr: any) {
+              reject(new Error(vaultErr.message || 'Apple Pay tokenization network error'));
             }
-            sendToVaultDirectly();
           });
 
           setStatus('charging');
