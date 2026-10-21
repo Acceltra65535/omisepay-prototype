@@ -17,15 +17,6 @@ import {
   type SupportedCurrency,
 } from '../config/omise';
 
-// ============================================================
-// Omise Singapore (SG) Production Payment & Invoicing Portal
-// Enhanced for US High-Value Credit Card Transactions:
-// - Explicit Customer Entity (`cust_...`)
-// - Stripe Invoicing-style Invoice Reference & Line Item Description
-// - Level 2 / Level 3 Transaction Metadata
-// - Strict International AVS & 3D Secure 2.0 Compliance
-// ============================================================
-
 type PaymentStatus =
   | 'idle'
   | 'tokenizing'
@@ -348,7 +339,7 @@ export const PaymentForm = () => {
       } else if (data.status === 'failed') {
         setError(
           data.failure_message ||
-            `Payment declined (${data.failure_code || 'transaction_declined'})`,
+          `Payment declined (${data.failure_code || 'transaction_declined'})`,
         );
         setStatus('failed');
         sessionStorage.removeItem('omise_last_charge_id');
@@ -544,7 +535,7 @@ export const PaymentForm = () => {
 
     try {
       const session = new (window as any).ApplePaySession(3, request);
-      
+
       session.onvalidatemerchant = async (event: any) => {
         try {
           const res = await fetch('/api/applepay/validate-merchant', {
@@ -566,7 +557,7 @@ export const PaymentForm = () => {
       session.onpaymentauthorized = async (event: any) => {
         try {
           setStatus('tokenizing');
-          
+
           // Tokenize Apple Pay with Omise Vault.
           // Omise requires tokenization[method], tokenization[data] and tokenization[merchant_id]
           // (the Apple Pay Merchant ID registered with Omise, e.g. merchant.omise.sg.prod).
@@ -747,8 +738,8 @@ export const PaymentForm = () => {
                 reject(
                   new Error(
                     response.message ||
-                      response.location ||
-                      'Card tokenization failed. Please verify your card details.',
+                    response.location ||
+                    'Card tokenization failed. Please verify your card details.',
                   ),
                 );
               }
@@ -812,7 +803,7 @@ export const PaymentForm = () => {
         } else if (chargeData.status === 'failed') {
           throw new Error(
             chargeData.failure_message ||
-              `Payment declined (${chargeData.failure_code || 'declined'})`,
+            `Payment declined (${chargeData.failure_code || 'declined'})`,
           );
         } else {
           throw new Error(`Unexpected charge status: ${chargeData.status}`);
@@ -871,11 +862,10 @@ export const PaymentForm = () => {
   // Base styling for form inputs
   const getInputClass = (fieldName: string) => {
     const hasError = Boolean(fieldErrors[fieldName]);
-    return `w-full rounded-xl border ${
-      hasError
+    return `w-full rounded-xl border ${hasError
         ? 'border-red-400 bg-red-50/20 text-red-900 focus:border-red-500 focus:ring-red-100'
         : 'border-slate-200 bg-slate-50/50 text-slate-800 focus:border-indigo-400 focus:bg-white focus:ring-indigo-100'
-    } px-4 py-3 text-sm transition-all placeholder:text-slate-400 focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60`;
+      } px-4 py-3 text-sm transition-all placeholder:text-slate-400 focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60`;
   };
 
   // ── Render: Verifying (after 3DS callback) ─────────────────
@@ -1159,11 +1149,10 @@ export const PaymentForm = () => {
                       });
                     }
                   }}
-                  className={`flex flex-col sm:flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-xl py-2.5 px-3 transition-all ${
-                    isSelected
+                  className={`flex flex-col sm:flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-xl py-2.5 px-3 transition-all ${isSelected
                       ? 'bg-white text-indigo-700 shadow-md ring-2 ring-indigo-500 font-bold'
                       : 'bg-white/70 text-slate-600 hover:bg-white hover:text-slate-900 border border-slate-200/80 font-medium'
-                  }`}
+                    }`}
                 >
                   <span className="text-lg sm:text-base leading-none">{cfg.flag}</span>
                   <div className="text-center sm:text-left">
