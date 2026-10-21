@@ -5,3 +5,5 @@ dist
 .cache
 .DS_Store
 *.pem
+*.key
+certs/

@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { MiddlewareHandler } from 'hono';
-import { OMISE_CONFIG } from '../config/omise';
+import {
+  OMISE_CONFIG,
+  SUPPORTED_CURRENCIES,
+  isSupportedCurrency,
+  type SupportedCurrency,
+} from '../config/omise';
 
 /**
  * Helper to dynamically load keys from .env if process.env hasn't loaded them
@@ -58,6 +63,11 @@ function isSecretKeyReady(key: string): boolean {
     key !== 'OMISE_SECRET_KEY_PLACEHOLDER' &&
     key.trim().length > 10
   );
+}
+
+function getDefaultCurrency(): SupportedCurrency {
+  const envCurrency = (process.env.OMISE_CURRENCY || readEnvFile().OMISE_CURRENCY || '').toLowerCase().trim();
+  return isSupportedCurrency(envCurrency) ? envCurrency : OMISE_CONFIG.defaultCurrency;
 }
 
 function getAuthHeader(secretKey: string): string {
@@ -140,9 +150,14 @@ const chargeApi = (): MiddlewareHandler => {
 
       const detectedIp = getClientIp(c);
 
+      const defaultCurrency = getDefaultCurrency();
+
       return c.json({
         publicKey: isPublicReady ? publicKey : '',
-        currency: 'sgd',
+        currency: defaultCurrency,
+        defaultCurrency,
+        supportedCurrencies: OMISE_CONFIG.supportedCurrencies,
+        currencyConfigs: SUPPORTED_CURRENCIES,
         isConfigured: isPublicReady && isSecretReady,
         isPublicKeySet: isPublicReady,
         isSecretKeySet: isSecretReady,
@@ -180,48 +195,53 @@ const chargeApi = (): MiddlewareHandler => {
           return c.json({ error: 'Invalid Apple validation URL' }, 400);
         }
 
-        const merchantId = process.env.APPLE_MERCHANT_ID || '';
-        const certPath = process.env.APPLE_MERCHANT_CERT_PATH || '';
-        const keyPath = process.env.APPLE_MERCHANT_KEY_PATH || '';
-        const displayName = process.env.APPLE_DISPLAY_NAME || 'Omise Pay';
-        const domainName = process.env.APPLE_DOMAIN_NAME || '';
+        const fileEnv = readEnvFile();
+        const merchantId = process.env.APPLE_MERCHANT_ID || fileEnv.APPLE_MERCHANT_ID || '';
+        const rawCertPath = process.env.APPLE_MERCHANT_CERT_PATH || fileEnv.APPLE_MERCHANT_CERT_PATH || './certs/certificate.pem';
+        const rawKeyPath = process.env.APPLE_MERCHANT_KEY_PATH || fileEnv.APPLE_MERCHANT_KEY_PATH || './certs/private_key.pem';
+        const displayName = process.env.APPLE_DISPLAY_NAME || fileEnv.APPLE_DISPLAY_NAME || 'Omise Pay';
+        const domainName = process.env.APPLE_DOMAIN_NAME || fileEnv.APPLE_DOMAIN_NAME || c.req.header('host')?.split(':')[0] || '';
 
-        if (!merchantId || !certPath || !keyPath) {
+        if (!merchantId) {
           console.error(
-            'Apple Pay Merchant Validation: Missing configuration.\n' +
-            'Please set the following environment variables in .env:\n' +
-            '  APPLE_MERCHANT_ID=merchant.co.omise.xxx\n' +
-            '  APPLE_MERCHANT_CERT_PATH=/path/to/merchant_id.pem\n' +
-            '  APPLE_MERCHANT_KEY_PATH=/path/to/merchant_id.key\n' +
-            '  APPLE_DISPLAY_NAME=Your Business Name\n' +
-            '  APPLE_DOMAIN_NAME=yourdomain.com\n' +
-            '\n' +
-            'These can be obtained from the Omise Dashboard under Apple Pay settings,\n' +
-            'or from your Apple Developer account at https://developer.apple.com\n'
+            'Apple Pay Merchant Validation: Missing merchantId in environment.'
           );
           return c.json(
             {
               error:
-                'Apple Pay 尚未配置。请在 Omise Dashboard 获取 Apple Pay Merchant Identity Certificate (.pem) 和 Private Key (.key)，' +
-                '然后在 .env 中设置 APPLE_MERCHANT_ID、APPLE_MERCHANT_CERT_PATH、APPLE_MERCHANT_KEY_PATH 环境变量。',
+                'Apple Pay 尚未配置 Merchant ID。请在 .env 中设置 APPLE_MERCHANT_ID。',
               code: 'applepay_not_configured',
             },
             503,
           );
         }
 
-        // Read cert and key files
-        const fs = await import('fs');
+        // Read cert and key files with multi-path resolution
+        const fsMod = await import('fs');
+        const pathMod = await import('path');
+
+        function loadPemFile(configuredPath: string, fallbacks: string[]): string {
+          const candidates = [configuredPath, ...fallbacks];
+          for (const cand of candidates) {
+            if (!cand) continue;
+            const resolved = pathMod.isAbsolute(cand) ? cand : pathMod.resolve(process.cwd(), cand);
+            if (fsMod.existsSync(resolved)) {
+              return fsMod.readFileSync(resolved, 'utf-8');
+            }
+          }
+          throw new Error(`无法找到文件: ${configuredPath}`);
+        }
+
         let cert: string;
         let key: string;
         try {
-          cert = fs.readFileSync(certPath, 'utf-8');
-          key = fs.readFileSync(keyPath, 'utf-8');
+          cert = loadPemFile(rawCertPath, ['./certs/apcert.pem', './certs/certificate.pem', './certificate.pem']);
+          key = loadPemFile(rawKeyPath, ['./certs/apkey.pem', './certs/private_key.pem', './private_key.pem']);
         } catch (fileErr: any) {
           console.error('Apple Pay cert/key file read error:', fileErr.message);
           return c.json(
             {
-              error: `无法读取 Apple Pay 证书文件: ${fileErr.message}。请检查 APPLE_MERCHANT_CERT_PATH 和 APPLE_MERCHANT_KEY_PATH 路径是否正确。`,
+              error: `无法读取 Apple Pay 证书文件: ${fileErr.message}。请检查 certs 目录中是否存在证书文件。`,
               code: 'applepay_cert_read_error',
             },
             500,
@@ -318,27 +338,37 @@ const chargeApi = (): MiddlewareHandler => {
         if (!token || typeof token !== 'string') {
           return c.json({ error: 'Missing or invalid card token' }, 400);
         }
+        const defaultCurr = getDefaultCurrency();
+        const normalizedCurrency = typeof currency === 'string' ? currency.toLowerCase().trim() : defaultCurr;
+        const finalCurrency: SupportedCurrency = isSupportedCurrency(normalizedCurrency) ? normalizedCurrency : defaultCurr;
+        const currencyConfig = SUPPORTED_CURRENCIES[finalCurrency] || SUPPORTED_CURRENCIES.sgd;
+        const currencySymbol = currencyConfig.symbol;
+
         if (!amount || typeof amount !== 'number' || amount < OMISE_CONFIG.minAmountSubunits) {
           return c.json(
-            { error: 'Invalid amount: minimum is S$1.00 (100 subunits)' },
+            { error: `Invalid amount: minimum is ${currencySymbol}1.00 (100 subunits)` },
             400,
           );
         }
         if (amount > OMISE_CONFIG.maxAmountSubunits) {
           return c.json(
-            { error: 'Amount exceeds maximum: S$20,000.00 (2,000,000 subunits)' },
+            { error: `Amount exceeds maximum: ${currencySymbol}20,000.00 (2,000,000 subunits)` },
             400,
           );
         }
         if (!return_uri || typeof return_uri !== 'string') {
           return c.json(
-            { error: 'Missing return_uri (required for Singapore 3D Secure verification)' },
+            { error: 'Missing return_uri (required for 3D Secure verification)' },
             400,
           );
         }
 
-        // Singapore Omise transactions strictly require SGD
-        const finalCurrency = 'sgd';
+        let finalReturnUri = return_uri.trim();
+        if (finalReturnUri.startsWith('/')) {
+          const host = c.req.header('x-forwarded-host') || c.req.header('host') || 'pay.cyberjar.io';
+          const proto = c.req.header('x-forwarded-proto') || 'https';
+          finalReturnUri = `${proto}://${host}${finalReturnUri}`;
+        }
 
         // ──────────────────────────────────────────────────────────
         // Extract Cardholder IP & Browser Context (3DS 2.0 browserIP)
@@ -416,12 +446,12 @@ const chargeApi = (): MiddlewareHandler => {
         // ──────────────────────────────────────────────────────────
         // Step 2: Create Charge with Customer & Invoice Context
         // ──────────────────────────────────────────────────────────
-        const isUsOrHighValue = (billing?.country === 'US') || (amount >= 100000);
+        const isUsOrHighValue = (billing?.country === 'US' || billing?.country === 'CA') || (amount >= 100000);
 
         const chargePayload: Record<string, any> = {
           amount: amount,
           currency: finalCurrency,
-          return_uri: return_uri,
+          return_uri: finalReturnUri,
           capture: true,
           description: invoiceDesc,
           metadata: {
@@ -431,6 +461,7 @@ const chargeApi = (): MiddlewareHandler => {
             customer_email: customerEmail,
             customer_name: customerName,
             customer_company: customerCompany,
+            charge_currency: finalCurrency.toUpperCase(),
             billing_country: billing?.country || '',
             billing_state: billing?.state || '',
             billing_city: billing?.city || '',
@@ -484,7 +515,7 @@ const chargeApi = (): MiddlewareHandler => {
             typeof rawErrorMessage === 'string' &&
             /amount must be less than or equal to/i.test(rawErrorMessage)
           ) {
-            rawErrorMessage = `${rawErrorMessage} (这是 Omise 对新开通 Live 账户默认的风控限额。如需提升至 S$20,000.00，请联系 Omise 客服 support@omise.co 申请提高单笔支付上限)`;
+            rawErrorMessage = `${rawErrorMessage} (这是 Omise 对新开通 Live 账户默认的风控限额。如需提升至单笔最高限额，请联系 Omise 客服 support@omise.co 申请提高单笔支付上限)`;
           }
 
           return c.json(

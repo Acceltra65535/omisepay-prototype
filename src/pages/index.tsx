@@ -8,11 +8,11 @@ export default async function HomePage() {
         OmisePay SG
       </h1>
       <p className="mt-3 text-slate-600">
-        A minimal viable credit card payment prototype powered by{' '}
+        A secure multi-currency payment portal powered by{' '}
         <a href="https://www.omise.co" target="_blank" rel="noreferrer" className="text-indigo-600 underline">
           Omise
         </a>
-        {' '}for Singapore (SGD).
+        {' '}supporting Singapore Dollar (SGD), US Dollar (USD), and Canadian Dollar (CAD).
       </p>
       <div className="mt-6 flex flex-wrap gap-3">
         <Link
@@ -31,10 +31,10 @@ export default async function HomePage() {
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
             <span className="relative inline-flex h-3 w-3 rounded-full bg-emerald-500"></span>
           </span>
-          Production Mode (Live)
+          Production Mode (Live) · Multi-Currency
         </div>
         <p>
-          Ready for live SGD credit card processing with 3D Secure 2.0 via Omise Singapore.
+          Ready for live SGD, USD, and CAD card & Apple Pay processing with 3D Secure 2.0 via Omise Singapore.
         </p>
       </div>
     </div>

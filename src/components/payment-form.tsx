@@ -12,6 +12,10 @@ import {
   validateAvsAddress,
   normalizeAvsForToken,
 } from '../utils/avs';
+import {
+  SUPPORTED_CURRENCIES,
+  type SupportedCurrency,
+} from '../config/omise';
 
 // ============================================================
 // Omise Singapore (SG) Production Payment & Invoicing Portal
@@ -169,7 +173,9 @@ export const PaymentForm = () => {
   const [customerEmail, setCustomerEmail] = useState('');
   const [customerCompany, setCustomerCompany] = useState('');
 
-  // Payment Amount
+  // Payment Currency & Amount (SGD default, plus USD and CAD)
+  const [currency, setCurrency] = useState<SupportedCurrency>('sgd');
+  const currencyConfig = SUPPORTED_CURRENCIES[currency] || SUPPORTED_CURRENCIES.sgd;
   const [amount, setAmount] = useState('1500.00');
 
   // Card Details
@@ -196,6 +202,7 @@ export const PaymentForm = () => {
   const [isLive, setIsLive] = useState(false);
   const [isApplePayAvailable, setIsApplePayAvailable] = useState(false);
   const scriptLoaded = useRef(false);
+  const publicKeyRef = useRef('');
 
   useEffect(() => {
     if (typeof window !== 'undefined' && (window as any).ApplePaySession) {
@@ -213,18 +220,37 @@ export const PaymentForm = () => {
   const cardBrand = useMemo(() => getCardBrand(cardNumber), [cardNumber]);
   const maxCvcLength = cardBrand === 'amex' ? 4 : 3;
 
-  // High-value calculation (>= S$1,000 SGD or US card)
+  // High-value calculation (>= 1,000 in currency, or US/CA card)
   const isHighValue = useMemo(() => {
     const amt = parseFloat(amount || '0');
-    return country === 'US' || amt >= 1000;
+    return country === 'US' || country === 'CA' || amt >= 1000;
   }, [amount, country]);
 
-  // Approximate USD amount reference (1 SGD ≈ 0.76 USD)
-  const usdReference = useMemo(() => {
+  // Dynamic cross-currency reference (SGD, USD, CAD transparent conversion)
+  const currencyReference = useMemo(() => {
     const amt = parseFloat(amount || '0');
     if (isNaN(amt) || amt <= 0) return null;
-    return (amt * 0.76).toFixed(2);
-  }, [amount]);
+    if (currency === 'sgd') {
+      return {
+        primary: `≈ $${(amt * 0.76).toFixed(2)} USD`,
+        secondary: `≈ CA$${(amt * 1.04).toFixed(2)} CAD`,
+        text: `Approx. ~$${(amt * 0.76).toFixed(2)} USD settled via Singapore Dollar`,
+      };
+    } else if (currency === 'usd') {
+      return {
+        primary: `≈ S$${(amt * 1.32).toFixed(2)} SGD`,
+        secondary: `≈ CA$${(amt * 1.37).toFixed(2)} CAD`,
+        text: `Billed directly in USD · settled via Omise Singapore Multi-Currency`,
+      };
+    } else {
+      // CAD
+      return {
+        primary: `≈ $${(amt * 0.73).toFixed(2)} USD`,
+        secondary: `≈ S$${(amt * 0.96).toFixed(2)} SGD`,
+        text: `Billed directly in CAD · settled via Omise Singapore Multi-Currency`,
+      };
+    }
+  }, [amount, currency]);
 
   // ── Load Configuration & Omise.js ─────────────────────────
 
@@ -239,11 +265,18 @@ export const PaymentForm = () => {
         setIsConfigured(config.isConfigured);
         setIsLive(config.isLive);
 
+        if (config.defaultCurrency && ['sgd', 'usd', 'cad'].includes(config.defaultCurrency.toLowerCase())) {
+          setCurrency(config.defaultCurrency.toLowerCase() as SupportedCurrency);
+        }
+
         if (!config.isConfigured) {
           return;
         }
 
         const setupOmise = () => {
+          if (config.publicKey) {
+            publicKeyRef.current = config.publicKey;
+          }
           if (window.Omise && config.publicKey) {
             window.Omise.setPublicKey(config.publicKey);
             setOmiseLoaded(true);
@@ -380,12 +413,13 @@ export const PaymentForm = () => {
   } => {
     const errors: Record<string, string> = {};
 
-    // 1. Amount validation (SGD 1.00 to SGD 20,000.00)
+    // 1. Amount validation (1.00 to 20,000.00 in selected currency)
     const amountNum = parseFloat(amount);
+    const symbol = currencyConfig.symbol;
     if (isNaN(amountNum) || amountNum < 1.0) {
-      errors.amount = 'Minimum amount is S$1.00';
+      errors.amount = `Minimum amount is ${symbol}1.00`;
     } else if (amountNum > 20000.0) {
-      errors.amount = 'Maximum amount is S$20,000.00';
+      errors.amount = `Maximum amount is ${symbol}20,000.00`;
     }
 
     // 2. Stripe Invoicing & Customer Entity Validation
@@ -483,6 +517,7 @@ export const PaymentForm = () => {
     state,
     postalCode,
     countryConfig,
+    currencyConfig,
   ]);
 
   // ── Apple Pay Flow ─────────────────────────────────────────
@@ -491,13 +526,13 @@ export const PaymentForm = () => {
     setError('');
     const amt = parseFloat(amount);
     if (isNaN(amt) || amt < 1.0) {
-      setError('Please enter a valid amount (Minimum S$1.00) before using Apple Pay.');
+      setError(`Please enter a valid amount (Minimum ${currencyConfig.symbol}1.00) before using Apple Pay.`);
       return;
     }
 
     const request = {
       countryCode: 'SG',
-      currencyCode: 'SGD',
+      currencyCode: currency.toUpperCase(),
       supportedNetworks: ['visa', 'masterCard', 'amex', 'discover'],
       merchantCapabilities: ['supports3DS'],
       total: { label: 'Omise Pay', amount: amt.toFixed(2) },
@@ -520,7 +555,7 @@ export const PaymentForm = () => {
           console.error('Apple Pay Merchant Validation Error:', err);
           session.abort();
           setError(err.message || 'Apple Pay Merchant Validation Failed. 请在 .env 中配置 APPLE_MERCHANT_ID、APPLE_MERCHANT_CERT_PATH、APPLE_MERCHANT_KEY_PATH。');
-          setStatus('failed');
+          setStatus('idle');
         }
       };
 
@@ -528,19 +563,61 @@ export const PaymentForm = () => {
         try {
           setStatus('tokenizing');
           
-          // Tokenize Apple Pay with Omise
+          // Tokenize Apple Pay with Omise (tries Omise.js first, then Omise Vault API fallback)
           const token = await new Promise<string>((resolve, reject) => {
-            window.Omise.createToken(
-              'applepay',
-              event.payment.token.paymentData,
-              (statusCode: number, response: any) => {
-                if (statusCode === 200) {
-                  resolve(response.id);
-                } else {
-                  reject(new Error(response.message || 'Apple Pay tokenization failed'));
+            const sendToVaultDirectly = async () => {
+              try {
+                const pk = publicKeyRef.current;
+                if (!pk) {
+                  return reject(new Error('Omise Public Key not loaded for Apple Pay'));
                 }
+                const formData = new URLSearchParams();
+                formData.append('tokenization[method]', 'applepay');
+                formData.append(
+                  'tokenization[data]',
+                  typeof event.payment.token.paymentData === 'string'
+                    ? event.payment.token.paymentData
+                    : JSON.stringify(event.payment.token.paymentData)
+                );
+                const vaultRes = await fetch('https://vault.omise.co/tokens', {
+                  method: 'POST',
+                  headers: {
+                    Authorization: 'Basic ' + btoa(pk + ':'),
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                  },
+                  body: formData.toString(),
+                });
+                const vaultData = await vaultRes.json();
+                if (vaultRes.ok && vaultData.id) {
+                  resolve(vaultData.id);
+                } else {
+                  reject(new Error(vaultData.message || 'Apple Pay tokenization failed'));
+                }
+              } catch (vaultErr: any) {
+                reject(new Error(vaultErr.message || 'Apple Pay tokenization network error'));
               }
-            );
+            };
+
+            if (window.Omise && typeof window.Omise.createToken === 'function') {
+              try {
+                window.Omise.createToken(
+                  'applepay',
+                  event.payment.token.paymentData,
+                  (statusCode: number, response: any) => {
+                    if (statusCode === 200 && response?.id) {
+                      resolve(response.id);
+                    } else {
+                      sendToVaultDirectly();
+                    }
+                  }
+                );
+                return;
+              } catch {
+                sendToVaultDirectly();
+                return;
+              }
+            }
+            sendToVaultDirectly();
           });
 
           setStatus('charging');
@@ -554,7 +631,7 @@ export const PaymentForm = () => {
             body: JSON.stringify({
               token,
               amount: amountInCents,
-              currency: 'sgd',
+              currency: currency,
               return_uri: returnUri,
               client_ref: clientRef,
               is_apple_pay: true,
@@ -592,14 +669,19 @@ export const PaymentForm = () => {
           console.error('Apple Pay Error:', err);
           session.completePayment({ status: (window as any).ApplePaySession.STATUS_FAILURE });
           setError(err.message || 'Apple Pay transaction failed');
-          setStatus('failed');
+          setStatus('idle');
         }
+      };
+
+      session.oncancel = () => {
+        setStatus('idle');
       };
 
       session.begin();
     } catch (err: any) {
       console.error('Failed to start Apple Pay:', err);
       setError('Apple Pay is not available on this device or browser.');
+      setStatus('idle');
     }
   };
 
@@ -700,7 +782,7 @@ export const PaymentForm = () => {
           body: JSON.stringify({
             token,
             amount: amountInCents,
-            currency: 'sgd',
+            currency: currency,
             return_uri: returnUri,
             client_ref: clientRef,
             customer: {
@@ -769,6 +851,7 @@ export const PaymentForm = () => {
       postalCode,
       countryConfig,
       omiseLoaded,
+      currency,
       validateForm,
     ],
   );
@@ -880,20 +963,26 @@ export const PaymentForm = () => {
           </div>
 
           {/* Amount Summary */}
-          <div className="mb-6 rounded-xl bg-slate-50 p-4 border border-slate-100">
-            <span className="text-xs uppercase font-semibold text-slate-400">Total Amount Paid</span>
-            <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-3xl font-extrabold text-slate-900">
-                S${(chargeResult.amount / 100).toFixed(2)}
-              </span>
-              <span className="text-sm font-semibold text-slate-500">SGD</span>
-            </div>
-            {usdReference && (
-              <p className="mt-1 text-xs text-slate-500">
-                Approx. ~${usdReference} USD settled via Singapore Dollar
-              </p>
-            )}
-          </div>
+          {(() => {
+            const resCurr = (chargeResult.currency || currency).toLowerCase() as SupportedCurrency;
+            const resCfg = SUPPORTED_CURRENCIES[resCurr] || SUPPORTED_CURRENCIES.sgd;
+            return (
+              <div className="mb-6 rounded-xl bg-slate-50 p-4 border border-slate-100">
+                <span className="text-xs uppercase font-semibold text-slate-400">Total Amount Paid</span>
+                <div className="mt-1 flex items-baseline gap-2">
+                  <span className="text-3xl font-extrabold text-slate-900">
+                    {resCfg.symbol}{(chargeResult.amount / 100).toFixed(2)}
+                  </span>
+                  <span className="text-sm font-semibold text-slate-500">{resCfg.code.toUpperCase()}</span>
+                </div>
+                {currencyReference && (
+                  <p className="mt-1 text-xs text-slate-500">
+                    {currencyReference.text}
+                  </p>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Invoice & Customer Details Table */}
           <div className="mb-6 space-y-3 rounded-xl border border-slate-100 bg-slate-50/50 p-4 text-xs sm:text-sm">
@@ -1042,13 +1131,59 @@ export const PaymentForm = () => {
           <div className="text-right">
             <span className="text-xs text-slate-400">Amount Due</span>
             <div className="text-lg font-black text-slate-900">
-              S${parseFloat(amount || '0').toFixed(2)} <span className="text-xs font-medium text-slate-500">SGD</span>
+              {currencyConfig.symbol}{parseFloat(amount || '0').toFixed(2)}{' '}
+              <span className="text-xs font-semibold text-slate-500">{currencyConfig.code.toUpperCase()}</span>
             </div>
-            {usdReference && (
-              <span className="text-xs font-medium text-indigo-600">
-                ≈ ${usdReference} USD
+            {currencyReference && (
+              <span className="text-xs font-medium text-indigo-600 block">
+                {currencyReference.primary}
               </span>
             )}
+          </div>
+        </div>
+
+        {/* Currency Selector Pill Control */}
+        <div className="mb-6 rounded-2xl bg-gradient-to-r from-slate-50 via-indigo-50/40 to-slate-50 p-4 border border-slate-200/80 shadow-sm">
+          <div className="flex items-center justify-between mb-2.5">
+            <span className="text-xs font-bold uppercase tracking-wider text-slate-600 flex items-center gap-1.5">
+              <span>💳</span> Payment Currency
+            </span>
+            <span className="text-xs font-medium text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-100">
+              Multi-Currency (SGD · USD · CAD)
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-2.5">
+            {(['sgd', 'usd', 'cad'] as const).map((curr) => {
+              const cfg = SUPPORTED_CURRENCIES[curr];
+              const isSelected = currency === curr;
+              return (
+                <button
+                  key={curr}
+                  type="button"
+                  onClick={() => {
+                    setCurrency(curr);
+                    if (fieldErrors.amount) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.amount;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={`flex flex-col sm:flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-xl py-2.5 px-3 transition-all ${
+                    isSelected
+                      ? 'bg-white text-indigo-700 shadow-md ring-2 ring-indigo-500 font-bold'
+                      : 'bg-white/70 text-slate-600 hover:bg-white hover:text-slate-900 border border-slate-200/80 font-medium'
+                  }`}
+                >
+                  <span className="text-lg sm:text-base leading-none">{cfg.flag}</span>
+                  <div className="text-center sm:text-left">
+                    <span className="block text-xs sm:text-sm leading-tight">{cfg.code.toUpperCase()}</span>
+                    <span className="text-[10px] text-slate-400 block leading-tight">{cfg.symbol}</span>
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -1098,17 +1233,17 @@ export const PaymentForm = () => {
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label htmlFor="amount" className="block text-sm font-medium text-slate-700">
-                Payment Amount (SGD)
+                Payment Amount ({currencyConfig.code.toUpperCase()})
               </label>
-              {usdReference && (
+              {currencyReference && (
                 <span className="text-xs font-medium text-slate-400">
-                  Approx. ~${usdReference} USD
+                  {currencyReference.primary}
                 </span>
               )}
             </div>
             <div className="relative">
-              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm font-semibold text-slate-400">
-                S$
+              <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-bold text-slate-500">
+                {currencyConfig.symbol}
               </span>
               <input
                 id="amount"
@@ -1125,7 +1260,7 @@ export const PaymentForm = () => {
                     });
                   }
                 }}
-                className={getInputClass('amount') + ' pl-10 font-medium'}
+                className={getInputClass('amount') + (currencyConfig.symbol.length > 2 ? ' pl-14' : ' pl-11') + ' font-medium text-base'}
                 placeholder="0.00"
                 disabled={isProcessing}
               />
@@ -1134,7 +1269,7 @@ export const PaymentForm = () => {
               <p className="mt-1 text-xs text-red-500">{fieldErrors.amount}</p>
             ) : (
               <p className="mt-1 text-xs text-slate-400">
-                Minimum S$1.00 · Maximum S$20,000.00 SGD
+                Minimum {currencyConfig.symbol}1.00 · Maximum {currencyConfig.symbol}20,000.00 {currencyConfig.code.toUpperCase()}
               </p>
             )}
           </div>
@@ -1665,7 +1800,7 @@ export const PaymentForm = () => {
                   : 'Authorizing Transaction with Bank…'}
               </span>
             ) : (
-              `Authorize Payment of S$${parseFloat(amount || '0').toFixed(2)} SGD`
+              `Authorize Payment of ${currencyConfig.symbol}${parseFloat(amount || '0').toFixed(2)} ${currencyConfig.code.toUpperCase()}`
             )}
           </button>
 

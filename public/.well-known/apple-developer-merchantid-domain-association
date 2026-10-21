@@ -1,9 +1,0 @@
-This file should be replaced with the actual domain association file
-downloaded from the Omise Dashboard or Apple Developer Portal.
-
-Steps:
-1. Log in to Omise Dashboard → Settings → Apple Pay
-2. Add your domain and download the domain association file
-3. Replace this file's contents with the downloaded file
-4. The file must be accessible at:
-   https://yourdomain.com/.well-known/apple-developer-merchantid-domain-association
