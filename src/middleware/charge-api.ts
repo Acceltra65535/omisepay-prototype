@@ -523,6 +523,12 @@ const chargeApi = (): MiddlewareHandler => {
             rawErrorMessage = `${rawErrorMessage} (这是 Omise 对新开通 Live 账户默认的风控限额。如需提升至单笔最高限额，请联系 Omise 客服 support@omise.co 申请提高单笔支付上限)`;
           }
 
+          if (chargeData.code === 'failed_multi_currency') {
+            rawErrorMessage = `${rawErrorMessage} (Omise 账户未开通 Multi-currency，${finalCurrency.toUpperCase()} 无法换汇结算为 SGD。请联系 support@omise.co 申请开通；开通后也仅支持 Visa / Mastercard)`;
+          }
+
+          console.error('Omise charge creation failed:', chargeData.code, chargeData.message, { currency: finalCurrency, amount });
+
           return c.json(
             {
               error: rawErrorMessage,

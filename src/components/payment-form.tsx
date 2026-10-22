@@ -112,6 +112,20 @@ function getCardBrand(number: string): string {
   return '';
 }
 
+// Card brands accepted by the Omise Singapore account (verified against Omise Vault:
+// Visa / Mastercard / JCB are tokenized; Amex, Discover, Diners and UnionPay are rejected
+// with "brand not supported"). Contact Omise support to enable more brands, then extend this list.
+const ACCEPTED_CARD_BRANDS = ['visa', 'mastercard', 'jcb'] as const;
+const ACCEPTED_BRANDS_LABEL = 'Visa, Mastercard, JCB';
+
+// Turn Omise's raw "brand not supported (xxx)" error into an actionable message.
+function friendlyBrandError(message: string): string {
+  if (/brand not supported/i.test(message)) {
+    return `This card type is not supported. Please use a ${ACCEPTED_BRANDS_LABEL} card. (${message})`;
+  }
+  return message;
+}
+
 const CardBrandIcon = ({ brand }: { brand: string }) => {
   const icons: Record<string, string> = {
     visa: '💳 Visa',
@@ -441,6 +455,11 @@ export const PaymentForm = () => {
       errors.cardNumber = 'Card number is required';
     } else if (rawCard.length < 13 || rawCard.length > 19) {
       errors.cardNumber = 'Invalid card number (13-19 digits required)';
+    } else if (!(ACCEPTED_CARD_BRANDS as readonly string[]).includes(cardBrand)) {
+      errors.cardNumber = `This card type is not supported. Please use a ${ACCEPTED_BRANDS_LABEL} card.`;
+    } else if (currency !== 'sgd' && cardBrand === 'jcb') {
+      // Omise Multi-currency (non-SGD charges) only supports Visa / Mastercard.
+      errors.cardNumber = 'JCB cards can only be charged in SGD. Please switch to SGD or use a Visa / Mastercard card.';
     }
 
     // 5. Expiration Date
@@ -512,6 +531,7 @@ export const PaymentForm = () => {
     state,
     postalCode,
     countryConfig,
+    currency,
     currencyConfig,
   ]);
 
@@ -528,7 +548,8 @@ export const PaymentForm = () => {
     const request = {
       countryCode: 'SG',
       currencyCode: currency.toUpperCase(),
-      supportedNetworks: ['visa', 'masterCard', 'amex', 'discover'],
+      // Omise Multi-currency only accepts Visa / Mastercard, so JCB is offered for SGD only.
+      supportedNetworks: currency === 'sgd' ? ['visa', 'masterCard', 'jcb'] : ['visa', 'masterCard'],
       merchantCapabilities: ['supports3DS'],
       total: { label: 'Omise Pay', amount: amt.toFixed(2) },
     };
@@ -559,8 +580,10 @@ export const PaymentForm = () => {
           setStatus('tokenizing');
 
           // Tokenize Apple Pay with Omise Vault.
-          // Omise requires tokenization[method], tokenization[data] and tokenization[merchant_id]
-          // (the Apple Pay Merchant ID registered with Omise, e.g. merchant.omise.sg.prod).
+          // Omise requires tokenization[method], tokenization[data], tokenization[merchant_id]
+          // (the Apple Pay Merchant ID registered with Omise, e.g. merchant.omise.sg.prod) and
+          // tokenization[brand] (the network the customer picked in the sheet, e.g. "Visa").
+          // Without brand, the resulting card has no brand and Omise rejects it as "brand not supported".
           const token = await new Promise<string>(async (resolve, reject) => {
             try {
               const pk = publicKeyRef.current;
@@ -577,6 +600,8 @@ export const PaymentForm = () => {
               const formData = new URLSearchParams();
               formData.append('tokenization[method]', 'applepay');
               formData.append('tokenization[merchant_id]', merchantId);
+              // Apple Pay reports "Visa" / "MasterCard" / "JCB", which match Omise's brand names.
+              formData.append('tokenization[brand]', event.payment.token.paymentMethod?.network || '');
               formData.append(
                 'tokenization[data]',
                 typeof paymentData === 'string' ? paymentData : JSON.stringify(paymentData),
@@ -648,7 +673,7 @@ export const PaymentForm = () => {
         } catch (err: any) {
           console.error('Apple Pay Error:', err);
           session.completePayment({ status: (window as any).ApplePaySession.STATUS_FAILURE });
-          setError(err.message || 'Apple Pay transaction failed');
+          setError(friendlyBrandError(err.message || 'Apple Pay transaction failed'));
           setStatus('idle');
         }
       };
@@ -809,7 +834,7 @@ export const PaymentForm = () => {
           throw new Error(`Unexpected charge status: ${chargeData.status}`);
         }
       } catch (err: any) {
-        setError(err.message || 'An unexpected error occurred during payment.');
+        setError(friendlyBrandError(err.message || 'An unexpected error occurred during payment.'));
         setStatus('idle');
       }
     },
