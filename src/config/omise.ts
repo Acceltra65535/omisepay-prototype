@@ -1,4 +1,5 @@
 export type SupportedCurrency = 'sgd' | 'usd' | 'cad';
+export type CardBrand = 'visa' | 'mastercard' | 'jcb';
 
 export interface CurrencyConfig {
   code: SupportedCurrency;
@@ -10,6 +11,9 @@ export interface CurrencyConfig {
   minSubunits: number;
   maxSubunits: number;
   defaultAmount: string;
+  supportedBrands: readonly CardBrand[];
+  applePayNetworks: readonly ('visa' | 'masterCard' | 'jcb')[];
+  supportedBrandsLabel: string;
 }
 
 export const SUPPORTED_CURRENCIES: Record<SupportedCurrency, CurrencyConfig> = {
@@ -23,6 +27,9 @@ export const SUPPORTED_CURRENCIES: Record<SupportedCurrency, CurrencyConfig> = {
     minSubunits: 100,      // 最低 S$1.00
     maxSubunits: 2000000,  // 最高 S$20,000.00
     defaultAmount: '1500.00',
+    supportedBrands: ['visa', 'mastercard', 'jcb'],
+    applePayNetworks: ['visa', 'masterCard', 'jcb'],
+    supportedBrandsLabel: 'Visa, Mastercard, JCB',
   },
   usd: {
     code: 'usd',
@@ -34,6 +41,9 @@ export const SUPPORTED_CURRENCIES: Record<SupportedCurrency, CurrencyConfig> = {
     minSubunits: 100,      // 最低 $1.00
     maxSubunits: 2000000,  // 最高 $20,000.00
     defaultAmount: '1000.00',
+    supportedBrands: ['visa', 'mastercard'],
+    applePayNetworks: ['visa', 'masterCard'],
+    supportedBrandsLabel: 'Visa, Mastercard',
   },
   cad: {
     code: 'cad',
@@ -45,11 +55,23 @@ export const SUPPORTED_CURRENCIES: Record<SupportedCurrency, CurrencyConfig> = {
     minSubunits: 100,      // 最低 CA$1.00
     maxSubunits: 2000000,  // 最高 CA$20,000.00
     defaultAmount: '1350.00',
+    supportedBrands: ['visa', 'mastercard'],
+    applePayNetworks: ['visa', 'masterCard'],
+    supportedBrandsLabel: 'Visa, Mastercard',
   },
 };
 
 export function isSupportedCurrency(value: string): value is SupportedCurrency {
   return ['sgd', 'usd', 'cad'].includes(value.toLowerCase().trim());
+}
+
+export function isCardBrandSupportedForCurrency(
+  brand: string,
+  currency: SupportedCurrency,
+): boolean {
+  const normalizedBrand = brand.toLowerCase().trim();
+  const cfg = SUPPORTED_CURRENCIES[currency] || SUPPORTED_CURRENCIES.sgd;
+  return (cfg.supportedBrands as readonly string[]).includes(normalizedBrand);
 }
 
 function resolveDefaultCurrency(): SupportedCurrency {
@@ -76,6 +98,7 @@ export const OMISE_CONFIG = {
   // 3D Secure 2.0 配置
   threeDS: {
     required: true,            // 生产环境强制要求 3DS
+    enforceForApplePay: true,
     defaultReturnPath: '/payment',
   },
 } as const;

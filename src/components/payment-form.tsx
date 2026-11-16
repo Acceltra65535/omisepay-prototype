@@ -14,8 +14,10 @@ import {
 } from '../utils/avs';
 import {
   SUPPORTED_CURRENCIES,
+  isCardBrandSupportedForCurrency,
   type SupportedCurrency,
 } from '../config/omise';
+import type { ExchangeRatesData } from '../utils/fx-rates';
 
 type PaymentStatus =
   | 'idle'
@@ -34,6 +36,7 @@ interface ChargeResult {
   authorized: boolean;
   paid: boolean;
   authorize_uri: string | null;
+  authenticated_by?: string | null;
   failure_code: string | null;
   failure_message: string | null;
   customer_id?: string | null;
@@ -43,7 +46,6 @@ interface ChargeResult {
     email: string;
     name?: string | null;
     phone?: string | null;
-    company?: string | null;
   } | null;
   card?: {
     last_digits: string;
@@ -119,9 +121,10 @@ const ACCEPTED_CARD_BRANDS = ['visa', 'mastercard', 'jcb'] as const;
 const ACCEPTED_BRANDS_LABEL = 'Visa, Mastercard, JCB';
 
 // Turn Omise's raw "brand not supported (xxx)" error into an actionable message.
-function friendlyBrandError(message: string): string {
+function friendlyBrandError(message: string, curr: SupportedCurrency): string {
+  const allowedLabel = SUPPORTED_CURRENCIES[curr]?.supportedBrandsLabel || ACCEPTED_BRANDS_LABEL;
   if (/brand not supported/i.test(message)) {
-    return `This card type is not supported. Please use a ${ACCEPTED_BRANDS_LABEL} card. (${message})`;
+    return `This card type is not supported for ${curr.toUpperCase()}. Please use a ${allowedLabel} card. (${message})`;
   }
   return message;
 }
@@ -176,12 +179,12 @@ export const PaymentForm = () => {
   const [invoiceNumber, setInvoiceNumber] = useState(() => `INV-2026-${Math.floor(1000 + Math.random() * 9000)}`);
   const [invoiceDescription, setInvoiceDescription] = useState('Professional Consulting Services');
   const [customerEmail, setCustomerEmail] = useState('');
-  const [customerCompany, setCustomerCompany] = useState('');
 
   // Payment Currency & Amount (SGD default, plus USD and CAD)
   const [currency, setCurrency] = useState<SupportedCurrency>('sgd');
   const currencyConfig = SUPPORTED_CURRENCIES[currency] || SUPPORTED_CURRENCIES.sgd;
   const [amount, setAmount] = useState('1500.00');
+  const [exchangeRates, setExchangeRates] = useState<ExchangeRatesData | null>(null);
 
   // Card Details
   const [name, setName] = useState('');
@@ -232,31 +235,38 @@ export const PaymentForm = () => {
     return country === 'US' || country === 'CA' || amt >= 1000;
   }, [amount, country]);
 
-  // Dynamic cross-currency reference (SGD, USD, CAD transparent conversion)
+  // Dynamic cross-currency reference (uses live FX rates from /api/config with safe fallback)
   const currencyReference = useMemo(() => {
     const amt = parseFloat(amount || '0');
     if (isNaN(amt) || amt <= 0) return null;
+
+    const rates = exchangeRates?.rates || { SGD: 1, USD: 0.745, CAD: 1.035 };
+    const rateSourceNote = exchangeRates?.source === 'live' ? 'Live FX' : 'Indicative FX';
+    const fromCode = currency.toUpperCase() as 'SGD' | 'USD' | 'CAD';
+    const fromRate = rates[fromCode] || 1;
+    const convertTo = (target: 'SGD' | 'USD' | 'CAD') => ((amt / fromRate) * (rates[target] || 1)).toFixed(2);
+
     if (currency === 'sgd') {
+      const usdAmt = convertTo('USD');
       return {
-        primary: `≈ $${(amt * 0.76).toFixed(2)} USD`,
-        secondary: `≈ CA$${(amt * 1.04).toFixed(2)} CAD`,
-        text: `Approx. ~$${(amt * 0.76).toFixed(2)} USD settled via Singapore Dollar`,
+        primary: `≈ $${usdAmt} USD`,
+        secondary: `≈ CA$${convertTo('CAD')} CAD`,
+        text: `${rateSourceNote}: ~$${usdAmt} USD settled via Singapore Dollar`,
       };
     } else if (currency === 'usd') {
       return {
-        primary: `≈ S$${(amt * 1.32).toFixed(2)} SGD`,
-        secondary: `≈ CA$${(amt * 1.37).toFixed(2)} CAD`,
-        text: `Billed directly in USD · settled via Omise Singapore Multi-Currency`,
+        primary: `≈ S$${convertTo('SGD')} SGD`,
+        secondary: `≈ CA$${convertTo('CAD')} CAD`,
+        text: `Billed directly in USD · settled via Omise Singapore Multi-Currency (${rateSourceNote})`,
       };
     } else {
-      // CAD
       return {
-        primary: `≈ $${(amt * 0.73).toFixed(2)} USD`,
-        secondary: `≈ S$${(amt * 0.96).toFixed(2)} SGD`,
-        text: `Billed directly in CAD · settled via Omise Singapore Multi-Currency`,
+        primary: `≈ $${convertTo('USD')} USD`,
+        secondary: `≈ S$${convertTo('SGD')} SGD`,
+        text: `Billed directly in CAD · settled via Omise Singapore Multi-Currency (${rateSourceNote})`,
       };
     }
-  }, [amount, currency]);
+  }, [amount, currency, exchangeRates]);
 
   // ── Load Configuration & Omise.js ─────────────────────────
 
@@ -272,6 +282,9 @@ export const PaymentForm = () => {
         setIsLive(config.isLive);
         if (config.applePayMerchantId) {
           applePayMerchantIdRef.current = config.applePayMerchantId;
+        }
+        if (config.exchangeRates) {
+          setExchangeRates(config.exchangeRates);
         }
 
         if (config.defaultCurrency && ['sgd', 'usd', 'cad'].includes(config.defaultCurrency.toLowerCase())) {
@@ -457,9 +470,9 @@ export const PaymentForm = () => {
       errors.cardNumber = 'Invalid card number (13-19 digits required)';
     } else if (!(ACCEPTED_CARD_BRANDS as readonly string[]).includes(cardBrand)) {
       errors.cardNumber = `This card type is not supported. Please use a ${ACCEPTED_BRANDS_LABEL} card.`;
-    } else if (currency !== 'sgd' && cardBrand === 'jcb') {
+    } else if (!isCardBrandSupportedForCurrency(cardBrand, currency)) {
       // Omise Multi-currency (non-SGD charges) only supports Visa / Mastercard.
-      errors.cardNumber = 'JCB cards can only be charged in SGD. Please switch to SGD or use a Visa / Mastercard card.';
+      errors.cardNumber = `JCB cards are only supported for SGD payments. For ${currency.toUpperCase()}, please use a Visa or Mastercard (or switch currency to SGD).`;
     }
 
     // 5. Expiration Date
@@ -544,13 +557,17 @@ export const PaymentForm = () => {
       setError(`Please enter a valid amount (Minimum ${currencyConfig.symbol}1.00) before using Apple Pay.`);
       return;
     }
+    if (amt > 20000.0) {
+      setError(`Amount exceeds maximum (${currencyConfig.symbol}20,000.00) for Apple Pay.`);
+      return;
+    }
 
     const request = {
       countryCode: 'SG',
       currencyCode: currency.toUpperCase(),
       // Omise Multi-currency only accepts Visa / Mastercard, so JCB is offered for SGD only.
-      supportedNetworks: currency === 'sgd' ? ['visa', 'masterCard', 'jcb'] : ['visa', 'masterCard'],
-      merchantCapabilities: ['supports3DS'],
+      supportedNetworks: [...currencyConfig.applePayNetworks],
+      merchantCapabilities: ['supports3DS', 'supportsCredit', 'supportsDebit'],
       total: { label: 'Omise Pay', amount: amt.toFixed(2) },
     };
 
@@ -629,6 +646,7 @@ export const PaymentForm = () => {
           const amountInCents = Math.round(amt * 100);
           const clientRef = 'om_ref_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
           const returnUri = window.location.origin + window.location.pathname + '?ref=' + clientRef;
+          const applePayNetwork = String(event.payment.token.paymentMethod?.network || '').toLowerCase();
 
           const chargeResponse = await fetch('/api/charge', {
             method: 'POST',
@@ -640,6 +658,7 @@ export const PaymentForm = () => {
               return_uri: returnUri,
               client_ref: clientRef,
               is_apple_pay: true,
+              card_brand: applePayNetwork || undefined,
               customer: customerEmail ? { email: customerEmail } : undefined,
               invoice: {
                 invoice_number: invoiceNumber.trim() || undefined,
@@ -653,7 +672,9 @@ export const PaymentForm = () => {
             throw new Error((chargeData as any).error || 'Payment processing failed');
           }
 
-          if (chargeData.authorize_uri) {
+          if (chargeData.authorize_uri && (!chargeData.paid || chargeData.status === 'pending')) {
+            session.completePayment({ status: (window as any).ApplePaySession.STATUS_SUCCESS });
+            setStatus('awaiting_3ds');
             window.sessionStorage.setItem('omise_last_charge_id', chargeData.id);
             window.location.href = chargeData.authorize_uri;
             return;
@@ -661,7 +682,7 @@ export const PaymentForm = () => {
 
           session.completePayment({ status: (window as any).ApplePaySession.STATUS_SUCCESS });
           setChargeResult(chargeData);
-          if (chargeData.status === 'successful') {
+          if (chargeData.status === 'successful' && chargeData.paid) {
             setStatus('success');
           } else if (chargeData.status === 'failed') {
             setStatus('failed');
@@ -673,7 +694,7 @@ export const PaymentForm = () => {
         } catch (err: any) {
           console.error('Apple Pay Error:', err);
           session.completePayment({ status: (window as any).ApplePaySession.STATUS_FAILURE });
-          setError(friendlyBrandError(err.message || 'Apple Pay transaction failed'));
+          setError(friendlyBrandError(err.message || 'Apple Pay transaction failed', currency));
           setStatus('idle');
         }
       };
@@ -790,10 +811,10 @@ export const PaymentForm = () => {
             currency: currency,
             return_uri: returnUri,
             client_ref: clientRef,
+            card_brand: cardBrand || undefined,
             customer: {
               email: customerEmail.trim(),
               name: name.trim(),
-              company: customerCompany.trim() || undefined,
             },
             invoice: {
               invoice_number: invoiceNumber.trim(),
@@ -811,20 +832,17 @@ export const PaymentForm = () => {
           );
         }
 
-        // Step 3: Handle result / 3D Secure redirection
-        if (chargeData.status === 'successful' && chargeData.paid) {
-          setChargeResult(chargeData);
-          setStatus('success');
-        } else if (
-          chargeData.status === 'pending' &&
-          chargeData.authorize_uri
-        ) {
+        // Step 3: Handle result / mandatory 3D Secure redirection
+        if (chargeData.authorize_uri && (!chargeData.paid || chargeData.status === 'pending')) {
           setStatus('awaiting_3ds');
           sessionStorage.setItem('omise_last_charge_id', chargeData.id);
           const redirectUri = chargeData.authorize_uri;
           setTimeout(() => {
             window.location.href = redirectUri;
           }, 800);
+        } else if (chargeData.status === 'successful' && chargeData.paid) {
+          setChargeResult(chargeData);
+          setStatus('success');
         } else if (chargeData.status === 'failed') {
           throw new Error(
             chargeData.failure_message ||
@@ -834,18 +852,18 @@ export const PaymentForm = () => {
           throw new Error(`Unexpected charge status: ${chargeData.status}`);
         }
       } catch (err: any) {
-        setError(friendlyBrandError(err.message || 'An unexpected error occurred during payment.'));
+        setError(friendlyBrandError(err.message || 'An unexpected error occurred during payment.', currency));
         setStatus('idle');
       }
     },
     [
       name,
       cardNumber,
+      cardBrand,
       expiry,
       cvc,
       amount,
       customerEmail,
-      customerCompany,
       invoiceNumber,
       invoiceDescription,
       country,
@@ -869,7 +887,6 @@ export const PaymentForm = () => {
     setCvc('');
     setAmount('1500.00');
     setCustomerEmail('');
-    setCustomerCompany('');
     setCountry('US');
     setStreet1('');
     setStreet2('');
@@ -1016,18 +1033,16 @@ export const PaymentForm = () => {
                 {chargeResult.customer?.email || customerEmail}
               </span>
             </div>
-            {(chargeResult.customer?.company || customerCompany) && (
-              <div className="flex justify-between py-1 border-b border-slate-100">
-                <span className="text-slate-500">Company / Organization</span>
-                <span className="text-slate-800">
-                  {chargeResult.customer?.company || customerCompany}
-                </span>
-              </div>
-            )}
             <div className="flex justify-between py-1 border-b border-slate-100">
               <span className="text-slate-500">Transaction ID</span>
               <span className="font-mono text-xs text-slate-700">
                 {chargeResult.id}
+              </span>
+            </div>
+            <div className="flex justify-between py-1 border-b border-slate-100">
+              <span className="text-slate-500">Authentication</span>
+              <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                ✓ {chargeResult.authenticated_by ? chargeResult.authenticated_by : '3D Secure 2.0 Verified'}
               </span>
             </div>
             {chargeResult.card && (
@@ -1166,13 +1181,12 @@ export const PaymentForm = () => {
                   type="button"
                   onClick={() => {
                     setCurrency(curr);
-                    if (fieldErrors.amount) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.amount;
-                        return next;
-                      });
-                    }
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.amount;
+                      delete next.cardNumber;
+                      return next;
+                    });
                   }}
                   className={`flex flex-col sm:flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-xl py-2.5 px-3 transition-all ${isSelected
                       ? 'bg-white text-indigo-700 shadow-md ring-2 ring-indigo-500 font-bold'
@@ -1290,7 +1304,7 @@ export const PaymentForm = () => {
               <div className="h-px flex-1 bg-slate-100" />
             </div>
 
-            {/* Customer Email & Phone Grid */}
+            {/* Customer Email & Invoice Memo Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label htmlFor="customer_email" className="mb-1.5 block text-sm font-medium text-slate-700">
@@ -1320,25 +1334,6 @@ export const PaymentForm = () => {
                 ) : (
                   <p className="mt-1 text-xs text-slate-400">For invoice receipt & bank 3DS</p>
                 )}
-              </div>
-            </div>
-
-            {/* Company / Organization (Optional) & Invoice Memo */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="customer_company" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
-                  <span>Company / Organization</span>
-                  <span className="text-xs font-normal text-slate-400">Optional</span>
-                </label>
-                <input
-                  id="customer_company"
-                  type="text"
-                  value={customerCompany}
-                  onChange={(e) => setCustomerCompany(e.target.value)}
-                  className={getInputClass('customerCompany')}
-                  placeholder="e.g. Acme Corporation LLC"
-                  disabled={isProcessing}
-                />
               </div>
 
               <div>
@@ -1430,8 +1425,12 @@ export const PaymentForm = () => {
                 />
                 <CardBrandIcon brand={cardBrand} />
               </div>
-              {fieldErrors.cardNumber && (
+              {fieldErrors.cardNumber ? (
                 <p className="mt-1 text-xs text-red-500">{fieldErrors.cardNumber}</p>
+              ) : (
+                <p className="mt-1 text-xs text-slate-400">
+                  Accepted for {currencyConfig.code.toUpperCase()}: {currencyConfig.supportedBrandsLabel}
+                </p>
               )}
             </div>
 

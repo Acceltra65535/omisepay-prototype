@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
@@ -6,8 +7,20 @@ import {
   OMISE_CONFIG,
   SUPPORTED_CURRENCIES,
   isSupportedCurrency,
+  isCardBrandSupportedForCurrency,
   type SupportedCurrency,
 } from '../config/omise';
+import {
+  savePendingCharge,
+  getPendingCharge,
+  updateChargeFromWebhook,
+  isWebhookEventProcessed,
+  getRecentWebhookEvents,
+  getCachedCustomerIdByEmail,
+  setCachedCustomerIdForEmail,
+  type StoredChargeEntry,
+} from '../utils/charge-store';
+import { getExchangeRates } from '../utils/fx-rates';
 
 /**
  * Helper to dynamically load keys from .env if process.env hasn't loaded them
@@ -35,24 +48,27 @@ function readEnvFile(): Record<string, string> {
   return env;
 }
 
-function getPublicKey(): string {
-  if (process.env.OMISE_PUBLIC_KEY && process.env.OMISE_PUBLIC_KEY !== 'OMISE_PUBLIC_KEY_PLACEHOLDER') {
-    return process.env.OMISE_PUBLIC_KEY.trim();
+function getEnvValue(key: string): string {
+  const procVal = process.env[key];
+  if (procVal && procVal.trim()) {
+    return procVal.trim();
   }
-  const fileEnv = readEnvFile();
-  if (fileEnv.OMISE_PUBLIC_KEY && fileEnv.OMISE_PUBLIC_KEY !== 'OMISE_PUBLIC_KEY_PLACEHOLDER') {
-    return fileEnv.OMISE_PUBLIC_KEY.trim();
+  const fileVal = readEnvFile()[key];
+  return fileVal ? fileVal.trim() : '';
+}
+
+function getPublicKey(): string {
+  const val = getEnvValue('OMISE_PUBLIC_KEY');
+  if (val && val !== 'OMISE_PUBLIC_KEY_PLACEHOLDER') {
+    return val;
   }
   return OMISE_CONFIG.publicKey;
 }
 
 function getSecretKey(): string {
-  if (process.env.OMISE_SECRET_KEY && process.env.OMISE_SECRET_KEY !== 'OMISE_SECRET_KEY_PLACEHOLDER') {
-    return process.env.OMISE_SECRET_KEY.trim();
-  }
-  const fileEnv = readEnvFile();
-  if (fileEnv.OMISE_SECRET_KEY && fileEnv.OMISE_SECRET_KEY !== 'OMISE_SECRET_KEY_PLACEHOLDER') {
-    return fileEnv.OMISE_SECRET_KEY.trim();
+  const val = getEnvValue('OMISE_SECRET_KEY');
+  if (val && val !== 'OMISE_SECRET_KEY_PLACEHOLDER') {
+    return val;
   }
   return OMISE_CONFIG.secretKey;
 }
@@ -66,7 +82,7 @@ function isSecretKeyReady(key: string): boolean {
 }
 
 function getDefaultCurrency(): SupportedCurrency {
-  const envCurrency = (process.env.OMISE_CURRENCY || readEnvFile().OMISE_CURRENCY || '').toLowerCase().trim();
+  const envCurrency = getEnvValue('OMISE_CURRENCY').toLowerCase();
   return isSupportedCurrency(envCurrency) ? envCurrency : OMISE_CONFIG.defaultCurrency;
 }
 
@@ -106,36 +122,386 @@ function getClientAcceptLanguage(c: any): string {
 }
 
 /**
- * In-memory map to store 3DS reference mappings (client_ref -> charge_id)
- * Keeps items for 1 hour to handle delayed 3DS returns.
+ * Verify Omise HMAC-SHA256 webhook signature against timestamp + raw body.
  */
-interface PendingChargeEntry {
-  chargeId: string;
-  createdAt: number;
-  customerId?: string | undefined;
-  invoiceNumber?: string | undefined;
-  customerEmail?: string | undefined;
-  customerName?: string | undefined;
-  customerCompany?: string | undefined;
-  invoiceDescription?: string | undefined;
-}
-const pendingChargesMap = new Map<string, PendingChargeEntry>();
+function verifyOmiseSignature(
+  rawBody: string,
+  signatureHeader: string | undefined,
+  timestampHeader: string | undefined,
+  secret: string,
+): boolean {
+  if (!signatureHeader || !timestampHeader) {
+    return false;
+  }
+  const signedPayload = `${timestampHeader.trim()}.${rawBody}`;
+  const expectedHex = crypto
+    .createHmac('sha256', secret)
+    .update(signedPayload, 'utf8')
+    .digest('hex');
+  const expectedBuf = Buffer.from(expectedHex, 'hex');
 
-// Clean up expired items (> 1 hour old) every 15 minutes
-setInterval(() => {
-  const oneHourAgo = Date.now() - 60 * 60 * 1000;
-  for (const [key, value] of pendingChargesMap.entries()) {
-    if (value.createdAt < oneHourAgo) {
-      pendingChargesMap.delete(key);
+  const candidateSignatures = signatureHeader
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  for (const sig of candidateSignatures) {
+    try {
+      const candidateBuf = Buffer.from(sig, 'hex');
+      if (
+        candidateBuf.length === expectedBuf.length &&
+        crypto.timingSafeEqual(expectedBuf, candidateBuf)
+      ) {
+        return true;
+      }
+    } catch {
+      // Ignore malformed signature fragment
     }
   }
-}, 15 * 60 * 1000);
+  return false;
+}
+
+/**
+ * Build a uniform client-facing charge response object.
+ */
+function formatChargeResponse(
+  chargeData: any,
+  opts?: {
+    clientRef?: string | undefined;
+    customerId?: string | undefined;
+    invoiceNumber?: string | undefined;
+    invoiceDescription?: string | undefined;
+    customerEmail?: string | undefined;
+    customerName?: string | undefined;
+    includeAuthRedirect?: boolean | undefined;
+  },
+) {
+  const email =
+    opts?.customerEmail ||
+    (chargeData.metadata && chargeData.metadata.customer_email) ||
+    '';
+  const name =
+    opts?.customerName ||
+    (chargeData.metadata && chargeData.metadata.customer_name) ||
+    null;
+
+  const base: Record<string, any> = {
+    id: chargeData.id,
+    amount: chargeData.amount,
+    currency: chargeData.currency,
+    status: chargeData.status,
+    authorized: chargeData.authorized,
+    paid: chargeData.paid,
+    authenticated_by: chargeData.authenticated_by || chargeData.authorization_type || null,
+    failure_code: chargeData.failure_code || null,
+    failure_message: chargeData.failure_message || null,
+    customer_id:
+      opts?.customerId ||
+      chargeData.customer ||
+      (chargeData.metadata && chargeData.metadata.customer_id) ||
+      null,
+    invoice_number:
+      opts?.invoiceNumber ||
+      (chargeData.metadata && chargeData.metadata.invoice_number) ||
+      null,
+    invoice_description: opts?.invoiceDescription || chargeData.description || null,
+    customer: email
+      ? {
+          email,
+          name,
+        }
+      : null,
+    card: chargeData.card
+      ? {
+          last_digits: chargeData.card.last_digits,
+          brand: chargeData.card.brand,
+          name: chargeData.card.name,
+        }
+      : null,
+    created_at: chargeData.created_at,
+  };
+
+  if (opts?.includeAuthRedirect) {
+    base.authorize_uri = chargeData.authorize_uri || null;
+    base.return_uri = chargeData.return_uri || null;
+    base.client_ref = opts.clientRef || null;
+  }
+
+  return base;
+}
+
+/**
+ * Build a friendly brand rejection message for a given currency.
+ */
+function buildUnsupportedBrandMessage(brand: string, currency: SupportedCurrency): string {
+  const upperCurr = currency.toUpperCase();
+  if (currency === 'sgd') {
+    return `Card brand ${brand.toUpperCase()} is not supported. Please use a Visa, Mastercard, or JCB card.`;
+  }
+  return `Card brand ${brand.toUpperCase()} is not supported for ${upperCurr} payments. Omise Multi-Currency (${upperCurr}) only supports Visa and Mastercard.`;
+}
+
+/**
+ * Resolve an existing Omise Customer by email (cache -> Omise Search API) and attach the new card,
+ * or create a new Customer entity when no existing record exists.
+ */
+async function resolveOrCreateCustomer(params: {
+  secretKey: string;
+  token: string;
+  currency: SupportedCurrency;
+  customerEmail: string;
+  customerName: string;
+  invoiceNumber: string;
+  clientIp: string;
+  userAgent: string;
+  billing: Record<string, any> | undefined;
+}): Promise<
+  | { ok: true; customerId: string | null; cardId: string | null }
+  | { ok: false; status: ContentfulStatusCode; error: string; code: string }
+> {
+  const {
+    secretKey,
+    token,
+    currency,
+    customerEmail,
+    customerName,
+    invoiceNumber,
+    clientIp,
+    userAgent,
+    billing,
+  } = params;
+
+  const normalizedEmail = customerEmail.trim().toLowerCase();
+  const customerDescParts = [
+    customerName,
+    invoiceNumber ? `[${invoiceNumber}]` : '',
+  ].filter(Boolean);
+  const customerDesc =
+    customerDescParts.length > 0 ? customerDescParts.join(' ') : `Customer ${customerEmail}`;
+
+  const metadataPayload = {
+    name: customerName,
+    invoice_number: invoiceNumber,
+    last_invoice_number: invoiceNumber,
+    registration_ip: clientIp,
+    last_ip: clientIp,
+    user_agent: userAgent,
+    billing_country: billing?.country || '',
+    billing_state: billing?.state || '',
+    billing_city: billing?.city || '',
+    billing_postal_code: billing?.postal_code || '',
+    billing_street1: billing?.street1 || '',
+  };
+
+  let existingCustId = getCachedCustomerIdByEmail(normalizedEmail);
+
+  // If not in local cache, query Omise Search API to avoid creating duplicate customers
+  if (!existingCustId) {
+    try {
+      const searchRes = await fetch(
+        `https://api.omise.co/search?scope=customer&query=${encodeURIComponent(normalizedEmail)}`,
+        {
+          method: 'GET',
+          headers: { Authorization: getAuthHeader(secretKey) },
+          signal: AbortSignal.timeout(4000),
+        },
+      );
+      if (searchRes.ok) {
+        const searchData = (await searchRes.json()) as { data?: any[] };
+        if (Array.isArray(searchData?.data)) {
+          const matched = searchData.data.find(
+            (item) =>
+              item &&
+              !item.deleted &&
+              typeof item.email === 'string' &&
+              item.email.trim().toLowerCase() === normalizedEmail,
+          );
+          if (matched?.id) {
+            existingCustId = String(matched.id);
+          }
+        }
+      }
+    } catch (searchErr) {
+      console.warn('Customer search lookup warning:', searchErr);
+    }
+  }
+
+  // Try attaching the card token to the existing customer via PATCH
+  if (existingCustId) {
+    try {
+      const patchRes = await fetch(`https://api.omise.co/customers/${existingCustId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: getAuthHeader(secretKey),
+        },
+        body: JSON.stringify({
+          card: token,
+          description: customerDesc,
+          metadata: metadataPayload,
+        }),
+      });
+      const patchData = await patchRes.json();
+
+      if (patchRes.ok && patchData.id) {
+        const cardsList = patchData.cards?.data;
+        const latestCard =
+          Array.isArray(cardsList) && cardsList.length > 0
+            ? cardsList[cardsList.length - 1]
+            : null;
+        const resolvedCardId = latestCard?.id || patchData.default_card || null;
+
+        if (latestCard?.brand && !isCardBrandSupportedForCurrency(latestCard.brand, currency)) {
+          return {
+            ok: false,
+            status: 400,
+            error: buildUnsupportedBrandMessage(latestCard.brand, currency),
+            code: 'brand_not_supported_for_currency',
+          };
+        }
+
+        setCachedCustomerIdForEmail(normalizedEmail, patchData.id);
+        return { ok: true, customerId: patchData.id, cardId: resolvedCardId };
+      }
+
+      if (
+        patchData?.code === 'invalid_card' ||
+        /brand not supported/i.test(String(patchData?.message || ''))
+      ) {
+        return {
+          ok: false,
+          status: 400,
+          error: patchData.message || 'Invalid or unsupported card',
+          code: patchData.code || 'invalid_card',
+        };
+      }
+
+      console.warn(
+        'Existing customer PATCH failed, creating new customer entity:',
+        patchData?.message || patchRes.status,
+      );
+    } catch (patchErr) {
+      console.warn('Customer PATCH network warning:', patchErr);
+    }
+  }
+
+  // Create a new Omise Customer entity
+  try {
+    const customerResponse = await fetch('https://api.omise.co/customers', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: getAuthHeader(secretKey),
+      },
+      body: JSON.stringify({
+        email: customerEmail,
+        description: customerDesc,
+        card: token,
+        metadata: metadataPayload,
+      }),
+    });
+
+    const customerData = await customerResponse.json();
+    if (customerResponse.ok && customerData.id) {
+      const cardsList = customerData.cards?.data;
+      const defaultCardObj = Array.isArray(cardsList) && cardsList.length > 0 ? cardsList[0] : null;
+      if (
+        defaultCardObj?.brand &&
+        !isCardBrandSupportedForCurrency(defaultCardObj.brand, currency)
+      ) {
+        return {
+          ok: false,
+          status: 400,
+          error: buildUnsupportedBrandMessage(defaultCardObj.brand, currency),
+          code: 'brand_not_supported_for_currency',
+        };
+      }
+
+      setCachedCustomerIdForEmail(normalizedEmail, customerData.id);
+      return {
+        ok: true,
+        customerId: customerData.id,
+        cardId: customerData.default_card || null,
+      };
+    }
+
+    if (
+      customerData?.code === 'invalid_card' ||
+      /brand not supported/i.test(String(customerData?.message || ''))
+    ) {
+      return {
+        ok: false,
+        status: 400,
+        error: customerData.message || 'Invalid or unsupported card',
+        code: customerData.code || 'invalid_card',
+      };
+    }
+
+    console.warn(
+      'Customer entity registration warning:',
+      customerData?.message || 'proceeding with direct token charge',
+    );
+  } catch (custErr) {
+    console.warn('Customer entity registration network warning:', custErr);
+  }
+
+  return { ok: true, customerId: null, cardId: null };
+}
+
+/**
+ * Sync charge status into persistent store.
+ */
+function persistChargeState(
+  chargeData: any,
+  opts?: {
+    clientRef?: string | undefined;
+    customerId?: string | undefined;
+    invoiceNumber?: string | undefined;
+    customerEmail?: string | undefined;
+    customerName?: string | undefined;
+    invoiceDescription?: string | undefined;
+  },
+): void {
+  if (!chargeData?.id) return;
+  const clientRef =
+    opts?.clientRef ||
+    (typeof chargeData?.metadata?.client_ref === 'string' && chargeData.metadata.client_ref
+      ? chargeData.metadata.client_ref
+      : undefined);
+
+  savePendingCharge({
+    chargeId: String(chargeData.id),
+    clientRef,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    customerId: opts?.customerId || (typeof chargeData.customer === 'string' ? chargeData.customer : undefined),
+    invoiceNumber:
+      opts?.invoiceNumber ||
+      (typeof chargeData?.metadata?.invoice_number === 'string' ? chargeData.metadata.invoice_number : undefined),
+    customerEmail:
+      opts?.customerEmail ||
+      (typeof chargeData?.metadata?.customer_email === 'string' ? chargeData.metadata.customer_email : undefined),
+    customerName:
+      opts?.customerName ||
+      (typeof chargeData?.metadata?.customer_name === 'string' ? chargeData.metadata.customer_name : undefined),
+    invoiceDescription:
+      opts?.invoiceDescription ||
+      (typeof chargeData.description === 'string' ? chargeData.description : undefined),
+    amount: typeof chargeData.amount === 'number' ? chargeData.amount : undefined,
+    currency: typeof chargeData.currency === 'string' ? chargeData.currency : undefined,
+    status: typeof chargeData.status === 'string' ? chargeData.status : undefined,
+    paid: typeof chargeData.paid === 'boolean' ? chargeData.paid : undefined,
+    authorized: typeof chargeData.authorized === 'boolean' ? chargeData.authorized : undefined,
+    failureCode: chargeData.failure_code ?? null,
+    failureMessage: chargeData.failure_message ?? null,
+  });
+}
 
 const chargeApi = (): MiddlewareHandler => {
   return async (c, next) => {
     // ──────────────────────────────────────────
-    // GET /api/config — Provide public key & status to frontend
-    // Note: NEVER exposes the secret key!
+    // GET /api/config — Provide public key, FX rates & currency/brand rules
+    // Note: NEVER exposes the secret key or webhook secret!
     // ──────────────────────────────────────────
     if (c.req.path === '/api/config' && c.req.method === 'GET') {
       const publicKey = getPublicKey();
@@ -149,12 +515,9 @@ const chargeApi = (): MiddlewareHandler => {
       const isLive = publicKey.startsWith('pkey_live_') || secretKey.startsWith('skey_live_');
 
       const detectedIp = getClientIp(c);
-
       const defaultCurrency = getDefaultCurrency();
-      // Apple Pay Merchant ID is not a secret (it is shown in the Apple Pay sheet and
-      // must be sent by the browser to Omise Vault as tokenization[merchant_id]).
-      const applePayMerchantId =
-        process.env.APPLE_MERCHANT_ID || readEnvFile().APPLE_MERCHANT_ID || '';
+      const applePayMerchantId = getEnvValue('APPLE_MERCHANT_ID');
+      const exchangeRates = await getExchangeRates();
 
       return c.json({
         publicKey: isPublicReady ? publicKey : '',
@@ -163,6 +526,8 @@ const chargeApi = (): MiddlewareHandler => {
         defaultCurrency,
         supportedCurrencies: OMISE_CONFIG.supportedCurrencies,
         currencyConfigs: SUPPORTED_CURRENCIES,
+        exchangeRates,
+        threeDSRequired: OMISE_CONFIG.threeDS.required,
         isConfigured: isPublicReady && isSecretReady,
         isPublicKeySet: isPublicReady,
         isSecretKeySet: isSecretReady,
@@ -174,17 +539,113 @@ const chargeApi = (): MiddlewareHandler => {
     }
 
     // ──────────────────────────────────────────────────
+    // GET & POST /api/webhooks/omise — Omise asynchronous webhook handler
+    // ──────────────────────────────────────────────────
+    if (c.req.path === '/api/webhooks/omise') {
+      const webhookSecret = getEnvValue('OMISE_WEBHOOK_SECRET');
+
+      if (c.req.method === 'GET') {
+        const recentEvents = getRecentWebhookEvents(10);
+        return c.json({
+          status: 'active',
+          endpoint: '/api/webhooks/omise',
+          signatureVerificationConfigured: Boolean(webhookSecret),
+          recentEventsCount: recentEvents.length,
+          recentEvents,
+        });
+      }
+
+      if (c.req.method === 'POST') {
+        try {
+          const rawBody = await c.req.text();
+
+          if (webhookSecret) {
+            const sigHeader = c.req.header('omise-signature');
+            const tsHeader = c.req.header('omise-signature-timestamp');
+            if (!verifyOmiseSignature(rawBody, sigHeader, tsHeader, webhookSecret)) {
+              return c.json({ error: 'Invalid Omise webhook signature' }, 401);
+            }
+          }
+
+          let event: any;
+          try {
+            event = JSON.parse(rawBody);
+          } catch {
+            return c.json({ error: 'Invalid JSON payload' }, 400);
+          }
+
+          if (
+            !event ||
+            event.object !== 'event' ||
+            typeof event.id !== 'string' ||
+            typeof event.key !== 'string' ||
+            !event.data ||
+            event.data.object !== 'charge' ||
+            typeof event.data.id !== 'string'
+          ) {
+            return c.json({ error: 'Invalid Omise webhook event payload' }, 400);
+          }
+
+          if (isWebhookEventProcessed(event.id)) {
+            return c.json({
+              received: true,
+              duplicate: true,
+              event_id: event.id,
+            });
+          }
+
+          let chargeData = event.data;
+          const secretKey = getSecretKey();
+          if (isSecretKeyReady(secretKey)) {
+            try {
+              const verifyRes = await fetch(
+                `https://api.omise.co/charges/${event.data.id}`,
+                {
+                  method: 'GET',
+                  headers: { Authorization: getAuthHeader(secretKey) },
+                  signal: AbortSignal.timeout(4000),
+                },
+              );
+              if (verifyRes.ok) {
+                const verifiedJson = await verifyRes.json();
+                if (verifiedJson && verifiedJson.object === 'charge' && verifiedJson.id) {
+                  chargeData = verifiedJson;
+                }
+              }
+            } catch (verifyErr) {
+              console.warn('Webhook API double-check fallback to event payload:', verifyErr);
+            }
+          }
+
+          const updated = updateChargeFromWebhook(chargeData, event.id, event.key);
+          console.info('Omise webhook processed:', {
+            eventId: event.id,
+            key: event.key,
+            chargeId: updated.chargeId,
+            status: updated.status,
+            paid: updated.paid,
+          });
+
+          return c.json({
+            received: true,
+            event_id: event.id,
+            key: event.key,
+            charge_id: updated.chargeId,
+            status: updated.status,
+            paid: updated.paid,
+          });
+        } catch (err: any) {
+          console.error('Omise webhook error:', err);
+          return c.json({ error: err.message || 'Webhook processing error' }, 500);
+        }
+      }
+    }
+
+    // ──────────────────────────────────────────────────
     // POST /api/applepay/validate-merchant
     // Apple Pay on the Web requires server-to-server
     // mutual TLS with Apple using Merchant Identity
     // Certificate + Private Key.
-    //
-    // Required env vars (or files):
-    //   APPLE_MERCHANT_ID          — e.g. "merchant.co.omise.xxx"
-    //   APPLE_MERCHANT_CERT_PATH   — path to .pem cert file
-    //   APPLE_MERCHANT_KEY_PATH    — path to .key private key file
-    //   APPLE_DISPLAY_NAME         — display name shown on Apple Pay sheet
-    //   APPLE_DOMAIN_NAME          — your verified domain (no https://)
     // ──────────────────────────────────────────────────
     if (c.req.path === '/api/applepay/validate-merchant' && c.req.method === 'POST') {
       try {
@@ -200,38 +661,31 @@ const chargeApi = (): MiddlewareHandler => {
           return c.json({ error: 'Invalid Apple validation URL' }, 400);
         }
 
-        const fileEnv = readEnvFile();
-        const merchantId = process.env.APPLE_MERCHANT_ID || fileEnv.APPLE_MERCHANT_ID || '';
-        const rawCertPath = process.env.APPLE_MERCHANT_CERT_PATH || fileEnv.APPLE_MERCHANT_CERT_PATH || './certs/certificate.pem';
-        const rawKeyPath = process.env.APPLE_MERCHANT_KEY_PATH || fileEnv.APPLE_MERCHANT_KEY_PATH || './certs/private_key.pem';
-        const displayName = process.env.APPLE_DISPLAY_NAME || fileEnv.APPLE_DISPLAY_NAME || 'Omise Pay';
-        const domainName = process.env.APPLE_DOMAIN_NAME || fileEnv.APPLE_DOMAIN_NAME || c.req.header('host')?.split(':')[0] || '';
+        const merchantId = getEnvValue('APPLE_MERCHANT_ID');
+        const rawCertPath = getEnvValue('APPLE_MERCHANT_CERT_PATH') || './certs/certificate.pem';
+        const rawKeyPath = getEnvValue('APPLE_MERCHANT_KEY_PATH') || './certs/private_key.pem';
+        const displayName = getEnvValue('APPLE_DISPLAY_NAME') || 'Omise Pay';
+        const domainName =
+          getEnvValue('APPLE_DOMAIN_NAME') || c.req.header('host')?.split(':')[0] || '';
 
         if (!merchantId) {
-          console.error(
-            'Apple Pay Merchant Validation: Missing merchantId in environment.'
-          );
+          console.error('Apple Pay Merchant Validation: Missing merchantId in environment.');
           return c.json(
             {
-              error:
-                'Apple Pay 尚未配置 Merchant ID。请在 .env 中设置 APPLE_MERCHANT_ID。',
+              error: 'Apple Pay 尚未配置 Merchant ID。请在 .env 中设置 APPLE_MERCHANT_ID。',
               code: 'applepay_not_configured',
             },
             503,
           );
         }
 
-        // Read cert and key files with multi-path resolution
-        const fsMod = await import('fs');
-        const pathMod = await import('path');
-
         function loadPemFile(configuredPath: string, fallbacks: string[]): string {
           const candidates = [configuredPath, ...fallbacks];
           for (const cand of candidates) {
             if (!cand) continue;
-            const resolved = pathMod.isAbsolute(cand) ? cand : pathMod.resolve(process.cwd(), cand);
-            if (fsMod.existsSync(resolved)) {
-              return fsMod.readFileSync(resolved, 'utf-8');
+            const resolved = path.isAbsolute(cand) ? cand : path.resolve(process.cwd(), cand);
+            if (fs.existsSync(resolved)) {
+              return fs.readFileSync(resolved, 'utf-8');
             }
           }
           throw new Error(`无法找到文件: ${configuredPath}`);
@@ -310,7 +764,7 @@ const chargeApi = (): MiddlewareHandler => {
     }
 
     // ──────────────────────────────────────────
-    // POST /api/charge — Create charge with 3DS
+    // POST /api/charge — Create charge with mandatory 3DS
     // ──────────────────────────────────────────
     if (c.req.path === '/api/charge' && c.req.method === 'POST') {
       const secretKey = getSecretKey();
@@ -337,6 +791,7 @@ const chargeApi = (): MiddlewareHandler => {
           invoice,
           billing,
           is_apple_pay,
+          card_brand,
         } = body;
 
         // Input validations
@@ -345,7 +800,9 @@ const chargeApi = (): MiddlewareHandler => {
         }
         const defaultCurr = getDefaultCurrency();
         const normalizedCurrency = typeof currency === 'string' ? currency.toLowerCase().trim() : defaultCurr;
-        const finalCurrency: SupportedCurrency = isSupportedCurrency(normalizedCurrency) ? normalizedCurrency : defaultCurr;
+        const finalCurrency: SupportedCurrency = isSupportedCurrency(normalizedCurrency)
+          ? normalizedCurrency
+          : defaultCurr;
         const currencyConfig = SUPPORTED_CURRENCIES[finalCurrency] || SUPPORTED_CURRENCIES.sgd;
         const currencySymbol = currencyConfig.symbol;
 
@@ -361,9 +818,24 @@ const chargeApi = (): MiddlewareHandler => {
             400,
           );
         }
+
+        // Cross-currency card brand guard (USD/CAD Multi-Currency supports Visa & Mastercard only)
+        if (typeof card_brand === 'string' && card_brand.trim()) {
+          const cleanBrand = card_brand.trim().toLowerCase();
+          if (!isCardBrandSupportedForCurrency(cleanBrand, finalCurrency)) {
+            return c.json(
+              {
+                error: buildUnsupportedBrandMessage(cleanBrand, finalCurrency),
+                code: 'brand_not_supported_for_currency',
+              },
+              400,
+            );
+          }
+        }
+
         if (!return_uri || typeof return_uri !== 'string') {
           return c.json(
-            { error: 'Missing return_uri (required for 3D Secure verification)' },
+            { error: 'Missing return_uri (required for mandatory 3D Secure verification)' },
             400,
           );
         }
@@ -375,83 +847,61 @@ const chargeApi = (): MiddlewareHandler => {
           finalReturnUri = `${proto}://${host}${finalReturnUri}`;
         }
 
-        // ──────────────────────────────────────────────────────────
+        try {
+          const parsedReturnUrl = new URL(finalReturnUri);
+          if (parsedReturnUrl.protocol !== 'http:' && parsedReturnUrl.protocol !== 'https:') {
+            return c.json(
+              { error: 'Invalid return_uri: must be a valid HTTP/HTTPS URL for mandatory 3D Secure verification' },
+              400,
+            );
+          }
+        } catch {
+          return c.json(
+            { error: 'Invalid return_uri: must be a valid HTTP/HTTPS URL for mandatory 3D Secure verification' },
+            400,
+          );
+        }
+
         // Extract Cardholder IP & Browser Context (3DS 2.0 browserIP)
-        // Passing the real client IP is paramount for lowering fraud
-        // risk scores in Visa Advanced Authorization & Mastercard Decision
-        // Intelligence, matching IP geolocation with issuing bank country.
-        // ──────────────────────────────────────────────────────────
         const clientIp = getClientIp(c) || (body.client_ip ? String(body.client_ip).trim() : '');
         const userAgent = getClientUserAgent(c) || (body.user_agent ? String(body.user_agent).trim() : '');
         const acceptLanguage = getClientAcceptLanguage(c);
 
-        // ──────────────────────────────────────────────────────────
-        // Step 1: Create / Register Customer Entity in Omise
-        // (Similar to Stripe Invoicing: binds card token to customer,
-        // establishes customer identity & contact details to pass
-        // US bank anti-fraud and 3DS risk evaluation)
-        // ──────────────────────────────────────────────────────────
+        // Step 1: Resolve or Create Customer Entity (deduplicated by email)
         let customerId: string | null = null;
         let cardId: string | null = null;
 
         const customerEmail = customer?.email ? String(customer.email).trim() : '';
         const customerName = customer?.name ? String(customer.name).trim() : '';
-        const customerCompany = customer?.company ? String(customer.company).trim() : '';
         const invoiceNumber = invoice?.invoice_number ? String(invoice.invoice_number).trim() : '';
-        const invoiceDesc = invoice?.description ? String(invoice.description).trim() : (invoiceNumber ? `Invoice #${invoiceNumber}` : 'Credit Card Payment');
+        const invoiceDesc = invoice?.description
+          ? String(invoice.description).trim()
+          : invoiceNumber
+            ? `Invoice #${invoiceNumber}`
+            : 'Credit Card Payment';
 
         if (customerEmail && !is_apple_pay) {
-          try {
-            const customerDescParts = [
-              customerName,
-              customerCompany ? `(${customerCompany})` : '',
-              invoiceNumber ? `[${invoiceNumber}]` : '',
-            ].filter(Boolean);
-            const customerDesc = customerDescParts.length > 0 ? customerDescParts.join(' ') : `Customer ${customerEmail}`;
-
-            const customerResponse = await fetch('https://api.omise.co/customers', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: getAuthHeader(secretKey),
-              },
-              body: JSON.stringify({
-                email: customerEmail,
-                description: customerDesc,
-                card: token,
-                metadata: {
-                  name: customerName,
-                  company: customerCompany,
-                  invoice_number: invoiceNumber,
-                  registration_ip: clientIp,
-                  user_agent: userAgent,
-                  billing_country: billing?.country || '',
-                  billing_state: billing?.state || '',
-                  billing_city: billing?.city || '',
-                  billing_postal_code: billing?.postal_code || '',
-                  billing_street1: billing?.street1 || '',
-                },
-              }),
-            });
-
-            const customerData = await customerResponse.json();
-            if (customerResponse.ok && customerData.id) {
-              customerId = customerData.id;
-              if (customerData.default_card) {
-                cardId = customerData.default_card;
-              }
-            } else {
-              console.warn('Customer entity registration warning:', customerData.message || 'proceeding with direct token charge');
-            }
-          } catch (custErr) {
-            console.warn('Customer entity registration network warning:', custErr);
+          const custResult = await resolveOrCreateCustomer({
+            secretKey,
+            token,
+            currency: finalCurrency,
+            customerEmail,
+            customerName,
+            invoiceNumber,
+            clientIp,
+            userAgent,
+            billing,
+          });
+          if (!custResult.ok) {
+            return c.json({ error: custResult.error, code: custResult.code }, custResult.status);
           }
+          customerId = custResult.customerId;
+          cardId = custResult.cardId;
         }
 
-        // ──────────────────────────────────────────────────────────
-        // Step 2: Create Charge with Customer & Invoice Context
-        // ──────────────────────────────────────────────────────────
-        const isUsOrHighValue = (billing?.country === 'US' || billing?.country === 'CA') || (amount >= 100000);
+        // Step 2: Create Charge with mandatory return_uri & full 3DS context
+        const isUsOrHighValue =
+          billing?.country === 'US' || billing?.country === 'CA' || amount >= 100000;
 
         const chargePayload: Record<string, any> = {
           amount: amount,
@@ -465,8 +915,9 @@ const chargeApi = (): MiddlewareHandler => {
             customer_id: customerId || '',
             customer_email: customerEmail,
             customer_name: customerName,
-            customer_company: customerCompany,
             charge_currency: finalCurrency.toUpperCase(),
+            payment_method: is_apple_pay ? 'apple_pay' : 'card',
+            three_ds_required: OMISE_CONFIG.threeDS.required,
             billing_country: billing?.country || '',
             billing_state: billing?.state || '',
             billing_city: billing?.city || '',
@@ -480,7 +931,6 @@ const chargeApi = (): MiddlewareHandler => {
           },
         };
 
-        // Pass cardholder IP directly to Omise API for bank fraud scoring
         if (clientIp) {
           chargePayload.ip = clientIp;
         }
@@ -494,7 +944,6 @@ const chargeApi = (): MiddlewareHandler => {
           chargePayload.card = token;
         }
 
-        // Request Omise Charges API
         const chargeResponse = await fetch('https://api.omise.co/charges', {
           method: 'POST',
           headers: {
@@ -527,7 +976,10 @@ const chargeApi = (): MiddlewareHandler => {
             rawErrorMessage = `${rawErrorMessage} (Omise 账户未开通 Multi-currency，${finalCurrency.toUpperCase()} 无法换汇结算为 SGD。请联系 support@omise.co 申请开通；开通后也仅支持 Visa / Mastercard)`;
           }
 
-          console.error('Omise charge creation failed:', chargeData.code, chargeData.message, { currency: finalCurrency, amount });
+          console.error('Omise charge creation failed:', chargeData.code, chargeData.message, {
+            currency: finalCurrency,
+            amount,
+          });
 
           return c.json(
             {
@@ -538,61 +990,27 @@ const chargeApi = (): MiddlewareHandler => {
           );
         }
 
-        // Cache client_ref mapping to charge.id for 3DS return resolution
-        if (client_ref && typeof client_ref === 'string') {
-          pendingChargesMap.set(client_ref, {
-            chargeId: chargeData.id,
-            customerId: customerId || undefined,
-            invoiceNumber: invoiceNumber || undefined,
-            customerEmail: customerEmail || undefined,
-            customerName: customerName || undefined,
-            customerCompany: customerCompany || undefined,
-            invoiceDescription: invoiceDesc || undefined,
-            createdAt: Date.now(),
-          });
-        }
-        if (chargeData.id) {
-          pendingChargesMap.set(chargeData.id, {
-            chargeId: chargeData.id,
-            customerId: customerId || undefined,
-            invoiceNumber: invoiceNumber || undefined,
-            customerEmail: customerEmail || undefined,
-            customerName: customerName || undefined,
-            customerCompany: customerCompany || undefined,
-            invoiceDescription: invoiceDesc || undefined,
-            createdAt: Date.now(),
-          });
-        }
-
-        return c.json({
-          id: chargeData.id,
-          amount: chargeData.amount,
-          currency: chargeData.currency,
-          status: chargeData.status,
-          authorized: chargeData.authorized,
-          paid: chargeData.paid,
-          authorize_uri: chargeData.authorize_uri || null,
-          return_uri: chargeData.return_uri || null,
-          failure_code: chargeData.failure_code || null,
-          failure_message: chargeData.failure_message || null,
-          client_ref: client_ref || null,
-          customer_id: customerId || chargeData.customer || null,
-          invoice_number: invoiceNumber || (chargeData.metadata && chargeData.metadata.invoice_number) || null,
-          invoice_description: invoiceDesc,
-          customer: customerEmail ? {
-            email: customerEmail,
-            name: customerName || null,
-            company: customerCompany || null,
-          } : null,
-          card: chargeData.card
-            ? {
-              last_digits: chargeData.card.last_digits,
-              brand: chargeData.card.brand,
-              name: chargeData.card.name,
-            }
-            : null,
-          created_at: chargeData.created_at,
+        // Persist charge & client_ref mapping to disk store
+        persistChargeState(chargeData, {
+          clientRef: typeof client_ref === 'string' ? client_ref : undefined,
+          customerId: customerId || undefined,
+          invoiceNumber: invoiceNumber || undefined,
+          customerEmail: customerEmail || undefined,
+          customerName: customerName || undefined,
+          invoiceDescription: invoiceDesc || undefined,
         });
+
+        return c.json(
+          formatChargeResponse(chargeData, {
+            clientRef: typeof client_ref === 'string' ? client_ref : undefined,
+            customerId: customerId || undefined,
+            invoiceNumber: invoiceNumber || undefined,
+            invoiceDescription: invoiceDesc,
+            customerEmail: customerEmail || undefined,
+            customerName: customerName || undefined,
+            includeAuthRedirect: true,
+          }),
+        );
       } catch (err: any) {
         console.error('Charge API error:', err);
         return c.json(
@@ -603,7 +1021,7 @@ const chargeApi = (): MiddlewareHandler => {
     }
 
     // ──────────────────────────────────────────────────
-    // GET /api/charge/ref/:ref — Retrieve charge via client_ref
+    // GET /api/charge/ref/:ref — Retrieve charge via client_ref (Disk Store + Omise Search fallback)
     // ──────────────────────────────────────────────────
     const refMatch = c.req.path.match(/^\/api\/charge\/ref\/([a-zA-Z0-9_\-]+)$/);
     if (refMatch && c.req.method === 'GET') {
@@ -611,19 +1029,48 @@ const chargeApi = (): MiddlewareHandler => {
       if (!ref) {
         return c.json({ error: 'Invalid reference' }, 400);
       }
-      const entry = pendingChargesMap.get(ref);
-      if (!entry) {
-        return c.json({ error: 'No charge found for this reference' }, 404);
-      }
-      const chargeId = entry.chargeId;
       const secretKey = getSecretKey();
       if (!isSecretKeyReady(secretKey)) {
         return c.json({ error: 'Omise Secret Key is not configured' }, 503);
       }
 
+      let entry: StoredChargeEntry | undefined = getPendingCharge(ref);
+
+      // Fallback to Omise Search API if store does not have this client_ref yet
+      if (!entry) {
+        try {
+          const searchRes = await fetch(
+            `https://api.omise.co/search?scope=charge&query=${encodeURIComponent(ref)}`,
+            {
+              method: 'GET',
+              headers: { Authorization: getAuthHeader(secretKey) },
+              signal: AbortSignal.timeout(4000),
+            },
+          );
+          if (searchRes.ok) {
+            const searchData = (await searchRes.json()) as { data?: any[] };
+            if (Array.isArray(searchData?.data) && searchData.data.length > 0) {
+              const matched =
+                searchData.data.find((ch) => ch?.metadata?.client_ref === ref) ||
+                searchData.data[0];
+              if (matched?.id) {
+                persistChargeState(matched, { clientRef: ref });
+                entry = getPendingCharge(ref);
+              }
+            }
+          }
+        } catch (searchErr) {
+          console.warn('Charge search lookup warning:', searchErr);
+        }
+      }
+
+      if (!entry) {
+        return c.json({ error: 'No charge found for this reference' }, 404);
+      }
+
       try {
         const chargeResponse = await fetch(
-          `https://api.omise.co/charges/${chargeId}`,
+          `https://api.omise.co/charges/${entry.chargeId}`,
           {
             method: 'GET',
             headers: { Authorization: getAuthHeader(secretKey) },
@@ -636,32 +1083,25 @@ const chargeApi = (): MiddlewareHandler => {
             400,
           );
         }
-        return c.json({
-          id: chargeData.id,
-          amount: chargeData.amount,
-          currency: chargeData.currency,
-          status: chargeData.status,
-          authorized: chargeData.authorized,
-          paid: chargeData.paid,
-          failure_code: chargeData.failure_code || null,
-          failure_message: chargeData.failure_message || null,
-          customer_id: entry.customerId || chargeData.customer || null,
-          invoice_number: entry.invoiceNumber || (chargeData.metadata && chargeData.metadata.invoice_number) || null,
-          invoice_description: entry.invoiceDescription || chargeData.description || null,
-          customer: entry.customerEmail || (chargeData.metadata && chargeData.metadata.customer_email) ? {
-            email: entry.customerEmail || chargeData.metadata?.customer_email,
-            name: entry.customerName || chargeData.metadata?.customer_name || null,
-            company: entry.customerCompany || chargeData.metadata?.customer_company || null,
-          } : null,
-          card: chargeData.card
-            ? {
-              last_digits: chargeData.card.last_digits,
-              brand: chargeData.card.brand,
-              name: chargeData.card.name,
-            }
-            : null,
-          created_at: chargeData.created_at,
+
+        persistChargeState(chargeData, {
+          clientRef: ref,
+          customerId: entry.customerId,
+          invoiceNumber: entry.invoiceNumber,
+          customerEmail: entry.customerEmail,
+          customerName: entry.customerName,
+          invoiceDescription: entry.invoiceDescription,
         });
+
+        return c.json(
+          formatChargeResponse(chargeData, {
+            customerId: entry.customerId,
+            invoiceNumber: entry.invoiceNumber,
+            invoiceDescription: entry.invoiceDescription,
+            customerEmail: entry.customerEmail,
+            customerName: entry.customerName,
+          }),
+        );
       } catch (err: any) {
         return c.json({ error: err.message || 'Failed to retrieve charge' }, 500);
       }
@@ -687,7 +1127,7 @@ const chargeApi = (): MiddlewareHandler => {
       }
 
       try {
-        const chargeId = chargeIdMatch[1];
+        const chargeId = chargeIdMatch[1]!;
         const chargeResponse = await fetch(
           `https://api.omise.co/charges/${chargeId}`,
           {
@@ -716,33 +1156,25 @@ const chargeApi = (): MiddlewareHandler => {
           );
         }
 
-        return c.json({
-          id: chargeData.id,
-          amount: chargeData.amount,
-          currency: chargeData.currency,
-          status: chargeData.status,
-          authorized: chargeData.authorized,
-          paid: chargeData.paid,
-          failure_code: chargeData.failure_code || null,
-          failure_message: chargeData.failure_message || null,
-          customer_id: chargeData.customer || (chargeData.metadata && chargeData.metadata.customer_id) || null,
-          invoice_number: (chargeData.metadata && chargeData.metadata.invoice_number) || null,
-          invoice_description: chargeData.description || null,
-          customer: (chargeData.metadata && chargeData.metadata.customer_email) ? {
-            email: chargeData.metadata.customer_email,
-            name: chargeData.metadata.customer_name || null,
-            phone: chargeData.metadata.customer_phone || null,
-            company: chargeData.metadata.customer_company || null,
-          } : null,
-          card: chargeData.card
-            ? {
-              last_digits: chargeData.card.last_digits,
-              brand: chargeData.card.brand,
-              name: chargeData.card.name,
-            }
-            : null,
-          created_at: chargeData.created_at,
+        const cached = getPendingCharge(chargeId);
+        persistChargeState(chargeData, {
+          clientRef: cached?.clientRef,
+          customerId: cached?.customerId,
+          invoiceNumber: cached?.invoiceNumber,
+          customerEmail: cached?.customerEmail,
+          customerName: cached?.customerName,
+          invoiceDescription: cached?.invoiceDescription,
         });
+
+        return c.json(
+          formatChargeResponse(chargeData, {
+            customerId: cached?.customerId,
+            invoiceNumber: cached?.invoiceNumber,
+            invoiceDescription: cached?.invoiceDescription,
+            customerEmail: cached?.customerEmail,
+            customerName: cached?.customerName,
+          }),
+        );
       } catch (err: any) {
         console.error('Charge retrieve error:', err);
         return c.json(
