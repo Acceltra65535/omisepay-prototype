@@ -8,6 +8,9 @@ import {
   SUPPORTED_CURRENCIES,
   isSupportedCurrency,
   isCardBrandSupportedForCurrency,
+  isPublicKeyConfigured,
+  isSecretKeyConfigured,
+  isLiveEnvironment,
   type SupportedCurrency,
 } from '../config/omise';
 import {
@@ -74,11 +77,7 @@ function getSecretKey(): string {
 }
 
 function isSecretKeyReady(key: string): boolean {
-  return Boolean(
-    key &&
-    key !== 'OMISE_SECRET_KEY_PLACEHOLDER' &&
-    key.trim().length > 10
-  );
+  return isSecretKeyConfigured(key);
 }
 
 function getDefaultCurrency(): SupportedCurrency {
@@ -506,13 +505,9 @@ const chargeApi = (): MiddlewareHandler => {
     if (c.req.path === '/api/config' && c.req.method === 'GET') {
       const publicKey = getPublicKey();
       const secretKey = getSecretKey();
-      const isPublicReady = Boolean(
-        publicKey &&
-        publicKey !== 'OMISE_PUBLIC_KEY_PLACEHOLDER' &&
-        publicKey.trim().length > 10
-      );
+      const isPublicReady = isPublicKeyConfigured(publicKey);
       const isSecretReady = isSecretKeyReady(secretKey);
-      const isLive = publicKey.startsWith('pkey_live_') || secretKey.startsWith('skey_live_');
+      const isLive = isLiveEnvironment(publicKey, secretKey);
 
       const detectedIp = getClientIp(c);
       const defaultCurrency = getDefaultCurrency();

@@ -106,33 +106,47 @@ export const OMISE_CONFIG = {
 /**
  * 判断 Public Key 是否已由用户正确配置
  */
-export function isPublicKeyConfigured(): boolean {
-  const key = OMISE_CONFIG.publicKey;
+export function isPublicKeyConfigured(key: string = OMISE_CONFIG.publicKey): boolean {
+  const trimmed = key.trim();
   return Boolean(
-    key &&
-    key !== 'OMISE_PUBLIC_KEY_PLACEHOLDER' &&
-    key.trim().length > 10
+    trimmed &&
+    trimmed !== 'OMISE_PUBLIC_KEY_PLACEHOLDER' &&
+    !trimmed.includes('your_actual_') &&
+    trimmed.length > 10
   );
 }
 
 /**
  * 判断 Secret Key 是否已由用户正确配置
  */
-export function isSecretKeyConfigured(): boolean {
-  const key = OMISE_CONFIG.secretKey;
+export function isSecretKeyConfigured(key: string = OMISE_CONFIG.secretKey): boolean {
+  const trimmed = key.trim();
   return Boolean(
-    key &&
-    key !== 'OMISE_SECRET_KEY_PLACEHOLDER' &&
-    key.trim().length > 10
+    trimmed &&
+    trimmed !== 'OMISE_SECRET_KEY_PLACEHOLDER' &&
+    !trimmed.includes('your_actual_') &&
+    trimmed.length > 10
   );
 }
 
 /**
  * 判断是否为 Live 生产环境密钥
+ * Omise 新版生产环境密钥为 `pkey_xxx` / `skey_xxx`（或旧版 `pkey_live_` / `skey_live_`），
+ * 仅测试环境密钥带有 `pkey_test_` / `skey_test_` 前缀。
  */
-export function isLiveEnvironment(): boolean {
-  return (
-    OMISE_CONFIG.publicKey.startsWith('pkey_live_') ||
-    OMISE_CONFIG.secretKey.startsWith('skey_live_')
-  );
+export function isLiveEnvironment(
+  publicKey: string = OMISE_CONFIG.publicKey,
+  secretKey: string = OMISE_CONFIG.secretKey,
+): boolean {
+  const pk = publicKey.trim();
+  const sk = secretKey.trim();
+  const isLivePublic =
+    isPublicKeyConfigured(pk) &&
+    pk.startsWith('pkey_') &&
+    !pk.startsWith('pkey_test_');
+  const isLiveSecret =
+    isSecretKeyConfigured(sk) &&
+    sk.startsWith('skey_') &&
+    !sk.startsWith('skey_test_');
+  return isLivePublic || isLiveSecret;
 }
