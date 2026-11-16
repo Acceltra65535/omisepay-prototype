@@ -8,3 +8,11 @@ dist
 *.key
 certs/
 data/
+ssl/*.pem
+ssl/*.crt
+ssl/*.key
+*.tar.gz
+Dockerfile
+docker-compose.yml
+logs/
+nginx.conf

@@ -121,7 +121,9 @@ function getClientAcceptLanguage(c: any): string {
 }
 
 /**
- * Verify Omise HMAC-SHA256 webhook signature against timestamp + raw body.
+ * Verify Omise HMAC-SHA256 webhook signature.
+ * Supports Omise Dashboard Base64-encoded webhook secrets as well as plain UTF-8 secrets,
+ * signed over `<timestamp>.<rawBody>` or `<rawBody>`, in either hex or base64 encoding.
  */
 function verifyOmiseSignature(
   rawBody: string,
@@ -129,32 +131,60 @@ function verifyOmiseSignature(
   timestampHeader: string | undefined,
   secret: string,
 ): boolean {
-  if (!signatureHeader || !timestampHeader) {
+  if (!signatureHeader) {
     return false;
   }
-  const signedPayload = `${timestampHeader.trim()}.${rawBody}`;
-  const expectedHex = crypto
-    .createHmac('sha256', secret)
-    .update(signedPayload, 'utf8')
-    .digest('hex');
-  const expectedBuf = Buffer.from(expectedHex, 'hex');
 
   const candidateSignatures = signatureHeader
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
 
-  for (const sig of candidateSignatures) {
-    try {
-      const candidateBuf = Buffer.from(sig, 'hex');
-      if (
-        candidateBuf.length === expectedBuf.length &&
-        crypto.timingSafeEqual(expectedBuf, candidateBuf)
-      ) {
-        return true;
+  if (candidateSignatures.length === 0) {
+    return false;
+  }
+
+  const keyBuffers: Buffer[] = [Buffer.from(secret, 'utf8')];
+  try {
+    const b64Buf = Buffer.from(secret, 'base64');
+    if (b64Buf.length > 0) {
+      keyBuffers.unshift(b64Buf);
+    }
+  } catch {
+    // Ignore base64 decode errors
+  }
+
+  const payloads: string[] =
+    timestampHeader && timestampHeader.trim()
+      ? [`${timestampHeader.trim()}.${rawBody}`, rawBody]
+      : [rawBody];
+
+  for (const keyBuf of keyBuffers) {
+    for (const payload of payloads) {
+      const digest = crypto.createHmac('sha256', keyBuf).update(payload, 'utf8').digest();
+      const expectedHexBuf = Buffer.from(digest.toString('hex'), 'utf8');
+      const expectedB64Buf = Buffer.from(digest.toString('base64'), 'utf8');
+
+      for (const sig of candidateSignatures) {
+        try {
+          const lowerHexBuf = Buffer.from(sig.toLowerCase(), 'utf8');
+          if (
+            lowerHexBuf.length === expectedHexBuf.length &&
+            crypto.timingSafeEqual(expectedHexBuf, lowerHexBuf)
+          ) {
+            return true;
+          }
+          const rawSigBuf = Buffer.from(sig, 'utf8');
+          if (
+            rawSigBuf.length === expectedB64Buf.length &&
+            crypto.timingSafeEqual(expectedB64Buf, rawSigBuf)
+          ) {
+            return true;
+          }
+        } catch {
+          // Ignore malformed signature fragment
+        }
       }
-    } catch {
-      // Ignore malformed signature fragment
     }
   }
   return false;

@@ -21,14 +21,14 @@ This repository demonstrates a minimal, end-to-end integration for processing cr
 
 ### 1. Prerequisites
 - An active [Omise Singapore account](https://www.omise.co/)
-- Public Key (`pkey_...`) & Secret Key (`skey_...`)
+- Public Key & Secret Key
 
 ### 2. Environment Variables
 Create a `.env` file in the root directory:
 
 \`\`\`bash
-OMISE_PUBLIC_KEY=pkey_test_xxx
-OMISE_SECRET_KEY=skey_test_xxx
+OMISE_PUBLIC_KEY=xxx
+OMISE_SECRET_KEY=xxx
 \`\`\`
 
 ## 📄 License
