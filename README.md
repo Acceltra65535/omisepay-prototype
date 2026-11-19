@@ -1,7 +1,7 @@
 # Omise SG Credit Card Payment — Minimal Implementation
 
 A clean, lightweight, and fully functional implementation of credit card payments using the [Omise](https://www.omise.co/) Singapore payment gateway.
-
+Minimal prototype for the Omise API
 ## Overview
 
 This repository demonstrates a minimal, end-to-end integration for processing credit card transactions via Omise SG. It cuts through unnecessary boilerplate to focus strictly on the essential flow:
