@@ -15,6 +15,7 @@ import {
 import {
   SUPPORTED_CURRENCIES,
   isCardBrandSupportedForCurrency,
+  isSupportedCurrency,
   type SupportedCurrency,
 } from '../config/omise';
 import type { ExchangeRatesData } from '../utils/fx-rates';
@@ -181,6 +182,80 @@ function getCountryDialCode(countryCode: string): string {
   return dialCodes[code] || '+1';
 }
 
+export interface CurrencyReference {
+  primary: string;
+  secondary: string;
+  text: string;
+}
+
+export function buildCurrencyReference(
+  amountMajor: number,
+  curr: SupportedCurrency,
+  exchangeRates: ExchangeRatesData | null,
+): CurrencyReference | null {
+  if (!Number.isFinite(amountMajor) || amountMajor <= 0) return null;
+
+  const rates = exchangeRates?.rates || { SGD: 1, USD: 0.745, CAD: 1.035 };
+  const rateSourceNote = exchangeRates?.source === 'live' ? 'Live FX' : 'Indicative FX';
+  const fromCode = curr.toUpperCase() as 'SGD' | 'USD' | 'CAD';
+  const fromRate = rates[fromCode] || 1;
+  const convertTo = (target: 'SGD' | 'USD' | 'CAD') =>
+    ((amountMajor / fromRate) * (rates[target] || 1)).toFixed(2);
+
+  const sgdAmt = convertTo('SGD');
+  const usdAmt = convertTo('USD');
+  const cadAmt = convertTo('CAD');
+
+  if (curr === 'sgd') {
+    return {
+      primary: `≈ $${usdAmt} USD`,
+      secondary: `≈ CA$${cadAmt} CAD`,
+      text: `${rateSourceNote}: ~$${usdAmt} USD settled via Singapore Dollar`,
+    };
+  }
+  if (curr === 'usd') {
+    return {
+      primary: `≈ S$${sgdAmt} SGD`,
+      secondary: `≈ CA$${cadAmt} CAD`,
+      text: `≈ S$${sgdAmt} SGD · Billed directly in USD via Omise Singapore Multi-Currency (${rateSourceNote})`,
+    };
+  }
+  return {
+    primary: `≈ $${usdAmt} USD`,
+    secondary: `≈ S$${sgdAmt} SGD`,
+    text: `≈ S$${sgdAmt} SGD · Billed directly in CAD via Omise Singapore Multi-Currency (${rateSourceNote})`,
+  };
+}
+
+export const LAST_CHARGE_STORAGE_KEY = 'omise_last_charge_id';
+
+function getStoredLastChargeId(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage.getItem(LAST_CHARGE_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredLastChargeId(chargeId: string): void {
+  if (typeof window === 'undefined' || !chargeId) return;
+  try {
+    window.sessionStorage.setItem(LAST_CHARGE_STORAGE_KEY, chargeId);
+  } catch {
+    // Ignore storage quota / privacy mode errors
+  }
+}
+
+function clearStoredLastChargeId(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.removeItem(LAST_CHARGE_STORAGE_KEY);
+  } catch {
+    // Ignore storage access errors
+  }
+}
+
 function normalizeInternationalPhone(raw: string): string {
   const cleaned = raw.trim().replace(/[\s\-().]/g, '');
   if (cleaned.startsWith('00')) {
@@ -276,12 +351,21 @@ export const PaymentForm = () => {
   const scriptLoaded = useRef(false);
   const publicKeyRef = useRef('');
   const applePayMerchantIdRef = useRef('');
+  const verifyRunIdRef = useRef(0);
+  const verifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (typeof window !== 'undefined' && (window as any).ApplePaySession) {
       const isAvailable = (window as any).ApplePaySession.canMakePayments();
       setIsApplePayAvailable(isAvailable);
     }
+    return () => {
+      verifyRunIdRef.current += 1;
+      if (verifyTimerRef.current) {
+        clearTimeout(verifyTimerRef.current);
+        verifyTimerRef.current = null;
+      }
+    };
   }, []);
 
   // Active country config
@@ -306,38 +390,19 @@ export const PaymentForm = () => {
   );
   const showCardholderEmailField = isThirdPartyCard || nameDiffersFromCustomer;
 
-  // Dynamic cross-currency reference (uses live FX rates from /api/config with safe fallback)
-  const currencyReference = useMemo(() => {
-    const amt = parseFloat(amount || '0');
-    if (isNaN(amt) || amt <= 0) return null;
+  // Dynamic cross-currency reference for form input (uses live FX rates from /api/config with safe fallback)
+  const currencyReference = useMemo(
+    () => buildCurrencyReference(parseFloat(amount || '0'), currency, exchangeRates),
+    [amount, currency, exchangeRates],
+  );
 
-    const rates = exchangeRates?.rates || { SGD: 1, USD: 0.745, CAD: 1.035 };
-    const rateSourceNote = exchangeRates?.source === 'live' ? 'Live FX' : 'Indicative FX';
-    const fromCode = currency.toUpperCase() as 'SGD' | 'USD' | 'CAD';
-    const fromRate = rates[fromCode] || 1;
-    const convertTo = (target: 'SGD' | 'USD' | 'CAD') => ((amt / fromRate) * (rates[target] || 1)).toFixed(2);
-
-    if (currency === 'sgd') {
-      const usdAmt = convertTo('USD');
-      return {
-        primary: `≈ $${usdAmt} USD`,
-        secondary: `≈ CA$${convertTo('CAD')} CAD`,
-        text: `${rateSourceNote}: ~$${usdAmt} USD settled via Singapore Dollar`,
-      };
-    } else if (currency === 'usd') {
-      return {
-        primary: `≈ S$${convertTo('SGD')} SGD`,
-        secondary: `≈ CA$${convertTo('CAD')} CAD`,
-        text: `Billed directly in USD · settled via Omise Singapore Multi-Currency (${rateSourceNote})`,
-      };
-    } else {
-      return {
-        primary: `≈ $${convertTo('USD')} USD`,
-        secondary: `≈ S$${convertTo('SGD')} SGD`,
-        text: `Billed directly in CAD · settled via Omise Singapore Multi-Currency (${rateSourceNote})`,
-      };
-    }
-  }, [amount, currency, exchangeRates]);
+  // Separate receipt FX reference anchored to actual charged amount & currency (prevents post-3DS default-state mismatch)
+  const receiptCurrencyReference = useMemo(() => {
+    if (!chargeResult || typeof chargeResult.amount !== 'number') return null;
+    const rawCurr = (chargeResult.currency || currency).toLowerCase();
+    const resCurr: SupportedCurrency = isSupportedCurrency(rawCurr) ? rawCurr : 'sgd';
+    return buildCurrencyReference(chargeResult.amount / 100, resCurr, exchangeRates);
+  }, [chargeResult, currency, exchangeRates]);
 
   // ── Load Configuration & Omise.js ─────────────────────────
 
@@ -404,7 +469,7 @@ export const PaymentForm = () => {
     const params = new URLSearchParams(window.location.search);
     const chargeId = params.get('charge_id');
     const ref = params.get('ref');
-    const sessionChargeId = sessionStorage.getItem('omise_last_charge_id');
+    const sessionChargeId = getStoredLastChargeId();
 
     if (chargeId && chargeId.startsWith('chrg_')) {
       setStatus('verifying');
@@ -420,10 +485,28 @@ export const PaymentForm = () => {
     }
   }, []);
 
-  async function verifyCharge(endpoint: string, attempt = 1) {
+  async function verifyCharge(endpoint: string, attempt = 1, runId?: number) {
+    let activeRunId = runId;
+    if (activeRunId === undefined) {
+      verifyRunIdRef.current += 1;
+      activeRunId = verifyRunIdRef.current;
+      if (verifyTimerRef.current) {
+        clearTimeout(verifyTimerRef.current);
+        verifyTimerRef.current = null;
+      }
+    }
+
+    if (activeRunId !== verifyRunIdRef.current) {
+      return;
+    }
+
     try {
       const response = await fetch(endpoint);
       const data = await response.json();
+
+      if (activeRunId !== verifyRunIdRef.current) {
+        return;
+      }
 
       if (!response.ok) {
         throw new Error(data.error || 'Failed to verify charge status');
@@ -433,33 +516,45 @@ export const PaymentForm = () => {
 
       if (data.status === 'successful' && data.paid) {
         setStatus('success');
-        sessionStorage.removeItem('omise_last_charge_id');
+        clearStoredLastChargeId();
       } else if (data.status === 'failed' || data.status === 'reversed') {
         setError(
           data.failure_message ||
           `Payment declined (${data.failure_code || (data.status === 'reversed' ? 'three_ds_authentication_required' : 'transaction_declined')})`,
         );
         setStatus('failed');
-        sessionStorage.removeItem('omise_last_charge_id');
+        clearStoredLastChargeId();
       } else if (data.status === 'pending') {
         if (attempt <= 5) {
-          setTimeout(() => verifyCharge(endpoint, attempt + 1), 2000);
+          verifyTimerRef.current = setTimeout(
+            () => verifyCharge(endpoint, attempt + 1, activeRunId),
+            2000,
+          );
         } else {
           setError(
             'Payment is currently processing. Please check your bank statement or contact support.',
           );
           setStatus('failed');
+          clearStoredLastChargeId();
         }
       } else {
         setError(`Unexpected charge status: ${data.status}`);
         setStatus('failed');
+        clearStoredLastChargeId();
       }
     } catch (err: any) {
+      if (activeRunId !== verifyRunIdRef.current) {
+        return;
+      }
       if (attempt <= 3) {
-        setTimeout(() => verifyCharge(endpoint, attempt + 1), 2000);
+        verifyTimerRef.current = setTimeout(
+          () => verifyCharge(endpoint, attempt + 1, activeRunId),
+          2000,
+        );
       } else {
         setError(err.message || 'Failed to verify payment');
         setStatus('failed');
+        clearStoredLastChargeId();
       }
     }
   }
@@ -658,11 +753,10 @@ export const PaymentForm = () => {
       setError('Please enter a valid customer email address before using Apple Pay.');
       return;
     }
-    if (isThirdPartyCard && cardholderEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail.trim())) {
-      if (showCardholderEmailField && cardholderEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail.trim())) {
-        setError('Please enter a valid cardholder email address before using Apple Pay.');
-        return;
-      }
+    if (showCardholderEmailField && cardholderEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail.trim())) {
+      setError('Please enter a valid cardholder email address before using Apple Pay.');
+      return;
+    }
       const normalizedApplePayPhone = cardholderPhone.trim()
         ? normalizeInternationalPhone(cardholderPhone)
         : '';
@@ -778,17 +872,16 @@ export const PaymentForm = () => {
                 payer: {
                   is_third_party_card: isThirdPartyCard,
                   cardholder_email:
-                    isThirdPartyCard && cardholderEmail.trim()
-                  showCardholderEmailField && cardholderEmail.trim()
-                  ? cardholderEmail.trim()
-                  : undefined,
-                cardholder_phone: normalizedApplePayPhone || undefined,
-              },
+                    showCardholderEmailField && cardholderEmail.trim()
+                      ? cardholderEmail.trim()
+                      : undefined,
+                  cardholder_phone: normalizedApplePayPhone || undefined,
+                },
                 invoice: {
-                invoice_number: invoiceNumber.trim() || undefined,
-                description: invoiceDescription.trim() || undefined,
-              },
-            }),
+                  invoice_number: invoiceNumber.trim() || undefined,
+                  description: invoiceDescription.trim() || undefined,
+                },
+              }),
           });
 
           const chargeData = await chargeResponse.json();
@@ -799,7 +892,7 @@ export const PaymentForm = () => {
           if (chargeData.authorize_uri && (!chargeData.paid || chargeData.status === 'pending')) {
             session.completePayment({ status: (window as any).ApplePaySession.STATUS_SUCCESS });
             setStatus('awaiting_3ds');
-            window.sessionStorage.setItem('omise_last_charge_id', chargeData.id);
+            saveStoredLastChargeId(chargeData.id);
             window.location.href = chargeData.authorize_uri;
             return;
           }
@@ -807,16 +900,20 @@ export const PaymentForm = () => {
           session.completePayment({ status: (window as any).ApplePaySession.STATUS_SUCCESS });
           setChargeResult(chargeData);
           if (chargeData.status === 'successful' && chargeData.paid) {
+            clearStoredLastChargeId();
             setStatus('success');
-          } else if (chargeData.status === 'failed') {
+          } else if (chargeData.status === 'failed' || chargeData.status === 'reversed') {
+            clearStoredLastChargeId();
             setStatus('failed');
             setError(chargeData.failure_message || 'Payment failed');
           } else {
+            saveStoredLastChargeId(chargeData.id);
             setStatus('verifying');
-            setTimeout(() => verifyCharge(`/api/charge/${chargeData.id}`), 2000);
+            verifyCharge(`/api/charge/${chargeData.id}`);
           }
         } catch (err: any) {
           console.error('Apple Pay Error:', err);
+          clearStoredLastChargeId();
           session.completePayment({ status: (window as any).ApplePaySession.STATUS_FAILURE });
           setError(friendlyBrandError(err.message || 'Apple Pay transaction failed', currency));
           setStatus('idle');
@@ -824,6 +921,7 @@ export const PaymentForm = () => {
       };
 
       session.oncancel = () => {
+        clearStoredLastChargeId();
         setStatus('idle');
       };
 
@@ -940,10 +1038,6 @@ export const PaymentForm = () => {
         const returnUri =
           window.location.origin + window.location.pathname + '?ref=' + clientRef;
 
-        const effectiveThirdParty =
-          isThirdPartyCard ||
-          customerName.trim().toLowerCase() !== cardholderName.trim().toLowerCase();
-
         const chargeResponse = await fetch('/api/charge', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -961,106 +1055,118 @@ export const PaymentForm = () => {
             payer: {
               cardholder_name: cardholderName.trim(),
               cardholder_email:
-                isThirdPartyCard && cardholderEmail.trim()
                 effectiveThirdParty && cardholderEmail.trim()
-              ? cardholderEmail.trim()
-              : undefined,
-            cardholder_phone: normalizedPhone || undefined,
-            is_third_party_card: effectiveThirdParty,
-          },
+                  ? cardholderEmail.trim()
+                  : undefined,
+              cardholder_phone: normalizedPhone || undefined,
+              is_third_party_card: effectiveThirdParty,
+            },
             invoice: {
-            invoice_number: invoiceNumber.trim(),
-            description: invoiceDescription.trim() || undefined,
-          },
+              invoice_number: invoiceNumber.trim(),
+              description: invoiceDescription.trim() || undefined,
+            },
             billing: normalizedAddress,
           }),
-      });
+        });
 
-  const chargeData: ChargeResult = await chargeResponse.json();
+        const chargeData: ChargeResult = await chargeResponse.json();
 
-  if (!chargeResponse.ok) {
-    throw new Error(
-      (chargeData as any).error || 'Payment processing failed',
-    );
-  }
+        if (!chargeResponse.ok) {
+          throw new Error(
+            (chargeData as any).error || 'Payment processing failed',
+          );
+        }
 
-  // Step 3: Handle result / mandatory 3D Secure redirection
-  if (chargeData.authorize_uri && (!chargeData.paid || chargeData.status === 'pending')) {
-    setStatus('awaiting_3ds');
-    sessionStorage.setItem('omise_last_charge_id', chargeData.id);
-    const redirectUri = chargeData.authorize_uri;
-    setTimeout(() => {
-      window.location.href = redirectUri;
-    }, 800);
-  } else if (chargeData.status === 'successful' && chargeData.paid) {
-    setChargeResult(chargeData);
-    setStatus('success');
-  } else if (chargeData.status === 'failed') {
-  } else if (chargeData.status === 'failed' || chargeData.status === 'reversed') {
-    throw new Error(
-      chargeData.failure_message ||
-      `Payment declined (${chargeData.failure_code || 'declined'})`,
-      `Payment declined (${chargeData.failure_code || (chargeData.status === 'reversed' ? 'three_ds_authentication_required' : 'declined')})`,
-    );
-  } else {
-    throw new Error(`Unexpected charge status: ${chargeData.status}`);
-  }
-} catch (err: any) {
-  setError(friendlyBrandError(err.message || 'An unexpected error occurred during payment.', currency));
-  setStatus('idle');
-}
+        // Step 3: Handle result / mandatory 3D Secure redirection
+        if (chargeData.authorize_uri && (!chargeData.paid || chargeData.status === 'pending')) {
+          setStatus('awaiting_3ds');
+          saveStoredLastChargeId(chargeData.id);
+          const redirectUri = chargeData.authorize_uri;
+          setTimeout(() => {
+            window.location.href = redirectUri;
+          }, 800);
+        } else if (chargeData.status === 'successful' && chargeData.paid) {
+          clearStoredLastChargeId();
+          setChargeResult(chargeData);
+          setStatus('success');
+        } else if (chargeData.status === 'failed' || chargeData.status === 'reversed') {
+          clearStoredLastChargeId();
+          throw new Error(
+            chargeData.failure_message ||
+            `Payment declined (${chargeData.failure_code || (chargeData.status === 'reversed' ? 'three_ds_authentication_required' : 'declined')})`,
+          );
+        } else {
+          clearStoredLastChargeId();
+          throw new Error(`Unexpected charge status: ${chargeData.status}`);
+        }
+      } catch (err: any) {
+        setError(friendlyBrandError(err.message || 'An unexpected error occurred during payment.', currency));
+        setStatus('idle');
+      }
     },
-[
-  customerName,
-  customerEmail,
-  cardholderName,
-  cardholderEmail,
-  cardholderPhone,
-  isThirdPartyCard,
-  nameDiffersFromCustomer,
-  cardNumber,
-  cardBrand,
-  expiry,
-  cvc,
-  amount,
-  invoiceNumber,
-  invoiceDescription,
-  country,
-  street1,
-  street2,
-  city,
-  state,
-  postalCode,
-  countryConfig,
-  omiseLoaded,
-  currency,
-  validateForm,
-],
+    [
+      customerName,
+      customerEmail,
+      cardholderName,
+      cardholderEmail,
+      cardholderPhone,
+      isThirdPartyCard,
+      nameDiffersFromCustomer,
+      cardNumber,
+      cardBrand,
+      expiry,
+      cvc,
+      amount,
+      invoiceNumber,
+      invoiceDescription,
+      country,
+      street1,
+      street2,
+      city,
+      state,
+      postalCode,
+      countryConfig,
+      omiseLoaded,
+      currency,
+      validateForm,
+    ],
   );
 
-const handleReset = () => {
-  setInvoiceNumber(generateOrderNumber());
-  setCustomerName('');
-  setCustomerEmail('');
-  setIsThirdPartyCard(false);
-  setCardholderName('');
-  setCardholderEmail('');
-  setCardholderPhone('');
-  setCardNumber('');
-  setExpiry('');
-  setCvc('');
-  setAmount('1500.00');
-  setCountry('US');
-  setStreet1('');
-  setStreet2('');
-  setCity('');
-  setState('');
-  setPostalCode('');
-  setStatus('idle');
-  setError('');
-  setFieldErrors({});
-  setChargeResult(null);
-};
+  const handleReset = () => {
+    verifyRunIdRef.current += 1;
+    if (verifyTimerRef.current) {
+      clearTimeout(verifyTimerRef.current);
+      verifyTimerRef.current = null;
+    }
+    clearStoredLastChargeId();
+    if (typeof window !== 'undefined' && window.location.search) {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has('ref') || params.has('charge_id')) {
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+    }
+    setInvoiceNumber(generateOrderNumber());
+    setCustomerName('');
+    setCustomerEmail('');
+    setIsThirdPartyCard(false);
+    setCardholderName('');
+    setCardholderEmail('');
+    setCardholderPhone('');
+    setCardNumber('');
+    setExpiry('');
+    setCvc('');
+    setAmount('1500.00');
+    setCountry('US');
+    setStreet1('');
+    setStreet2('');
+    setCity('');
+    setState('');
+    setPostalCode('');
+    setStatus('idle');
+    setError('');
+    setFieldErrors({});
+    setChargeResult(null);
+  };
 
 const isProcessing = status === 'tokenizing' || status === 'charging';
 
@@ -1138,7 +1244,11 @@ if (status === 'success' && chargeResult) {
               <h3 className="text-xl font-bold text-slate-800">Payment Receipt</h3>
             </div>
             <p className="mt-1 text-xs text-slate-500 font-mono">
-              {chargeResult.invoice_number || invoiceNumber} · {new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}
+              {chargeResult.invoice_number || invoiceNumber} · {(() => {
+                const parsed = chargeResult.created_at ? new Date(chargeResult.created_at) : null;
+                const displayDate = parsed && !Number.isNaN(parsed.getTime()) ? parsed : new Date();
+                return displayDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+              })()}
             </p>
           </div>
           <div className="rounded-lg border-2 border-emerald-600 bg-emerald-50 px-3 py-1 text-center font-bold uppercase tracking-wider text-emerald-700 text-sm">
@@ -1148,7 +1258,8 @@ if (status === 'success' && chargeResult) {
 
         {/* Amount Summary */}
         {(() => {
-          const resCurr = (chargeResult.currency || currency).toLowerCase() as SupportedCurrency;
+          const rawCurr = (chargeResult.currency || currency).toLowerCase();
+          const resCurr: SupportedCurrency = isSupportedCurrency(rawCurr) ? rawCurr : 'sgd';
           const resCfg = SUPPORTED_CURRENCIES[resCurr] || SUPPORTED_CURRENCIES.sgd;
           return (
             <div className="mb-6 rounded-xl bg-slate-50 p-4 border border-slate-100">
@@ -1159,9 +1270,9 @@ if (status === 'success' && chargeResult) {
                 </span>
                 <span className="text-sm font-semibold text-slate-500">{resCfg.code.toUpperCase()}</span>
               </div>
-              {currencyReference && (
+              {receiptCurrencyReference && (
                 <p className="mt-1 text-xs text-slate-500">
-                  {currencyReference.text}
+                  {receiptCurrencyReference.text}
                 </p>
               )}
             </div>
@@ -1737,44 +1848,40 @@ return (
             )}
           </div>
 
-          {/* Cardholder Email (Optional when paying with third-party card) */}
-          {isThirdPartyCard && (
-            {/* Cardholder Email (shown when paying with third-party card or cardholder name differs) */ }
+            {/* Cardholder Email (shown when paying with third-party card or cardholder name differs) */}
             {showCardholderEmailField && (
-            <div>
-              <label htmlFor="cardholder_email" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
-                <span>Cardholder Email</span>
-                <span className="text-xs font-normal text-slate-400">Optional</span>
-                <span className="text-xs font-normal text-slate-400">Optional · 3DS 2.0</span>
-              </label>
-              <input
-                id="cardholder_email"
-                type="email"
-                value={cardholderEmail}
-                onChange={(e) => {
-                  setCardholderEmail(e.target.value);
-                  if (fieldErrors.cardholderEmail) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.cardholderEmail;
-                      return next;
-                    });
-                  }
-                }}
-                className={getInputClass('cardholderEmail')}
-                placeholder="cardholder@example.com"
-                disabled={isProcessing}
-              />
-              {fieldErrors.cardholderEmail ? (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderEmail}</p>
-              ) : (
-                  <p className="mt-1 text-xs text-slate-400">Optional payer reference (invoice receipt still goes to customer email)</p>
+              <div>
+                <label htmlFor="cardholder_email" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
+                  <span>Cardholder Email</span>
+                  <span className="text-xs font-normal text-slate-400">Optional · 3DS 2.0</span>
+                </label>
+                <input
+                  id="cardholder_email"
+                  type="email"
+                  value={cardholderEmail}
+                  onChange={(e) => {
+                    setCardholderEmail(e.target.value);
+                    if (fieldErrors.cardholderEmail) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.cardholderEmail;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('cardholderEmail')}
+                  placeholder="cardholder@example.com"
+                  disabled={isProcessing}
+                />
+                {fieldErrors.cardholderEmail ? (
+                  <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderEmail}</p>
+                ) : (
                   <p className="mt-1 text-xs text-slate-400">
                     Used for 3DS 2.0 cardholder verification (invoice receipt still goes to customer email)
                   </p>
-              )}
-            </div>
-          )}
+                )}
+              </div>
+            )}
 
           {/* Cardholder Mobile Phone (Optional · EMV 3DS 2.0 Risk Scoring / SMS OTP) */}
           <div>
