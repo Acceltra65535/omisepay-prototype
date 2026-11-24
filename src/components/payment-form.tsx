@@ -177,11 +177,54 @@ function getCountryDialCode(countryCode: string): string {
   return dialCodes[code] || '+1';
 }
 
+function randomInt(max: number): number {
+  if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.getRandomValues === 'function') {
+    const arr = new Uint32Array(1);
+    globalThis.crypto.getRandomValues(arr);
+    const val = arr[0];
+    if (val !== undefined) {
+      return val % max;
+    }
+  }
+  return Math.floor(Math.random() * max);
+}
+
+/**
+ * Generate an order/invoice number formatted as:
+ * CBJ + Unix ms timestamp + 5 mixed-case alphanumeric characters (no hyphens).
+ */
+export function generateOrderNumber(): string {
+  const UPPER = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const LOWER = 'abcdefghijklmnopqrstuvwxyz';
+  const DIGITS = '0123456789';
+  const ALL = UPPER + LOWER + DIGITS;
+
+  const chars: string[] = [
+    UPPER.charAt(randomInt(UPPER.length)),
+    LOWER.charAt(randomInt(LOWER.length)),
+    DIGITS.charAt(randomInt(DIGITS.length)),
+    ALL.charAt(randomInt(ALL.length)),
+    ALL.charAt(randomInt(ALL.length)),
+  ];
+
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = randomInt(i + 1);
+    const a = chars[i];
+    const b = chars[j];
+    if (a !== undefined && b !== undefined) {
+      chars[i] = b;
+      chars[j] = a;
+    }
+  }
+
+  return `CBJ${Date.now()}${chars.join('')}`;
+}
+
 // ── Main Payment Form Component ─────────────────────────────
 
 export const PaymentForm = () => {
   // Customer & Order Identity Fields (separated from Cardholder / Payment Info)
-  const [invoiceNumber, setInvoiceNumber] = useState(() => `INV-2026-${Math.floor(1000 + Math.random() * 9000)}`);
+  const [invoiceNumber, setInvoiceNumber] = useState(() => generateOrderNumber());
   const [invoiceDescription, setInvoiceDescription] = useState('Professional Consulting Services');
   const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
@@ -937,7 +980,7 @@ export const PaymentForm = () => {
   );
 
   const handleReset = () => {
-    setInvoiceNumber(`INV-2026-${Math.floor(1000 + Math.random() * 9000)}`);
+    setInvoiceNumber(generateOrderNumber());
     setCustomerName('');
     setCustomerEmail('');
     setIsThirdPartyCard(false);
@@ -1225,7 +1268,10 @@ export const PaymentForm = () => {
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-5">
           <div>
             <div className="flex items-center gap-2">
-              <span className="rounded-md bg-indigo-100 px-2.5 py-1 text-xs font-bold text-indigo-700 font-mono">
+              <span
+                suppressHydrationWarning
+                className="rounded-md bg-indigo-100 px-2.5 py-1 text-xs font-bold text-indigo-700 font-mono"
+              >
                 {invoiceNumber}
               </span>
               <span className="text-xs text-slate-400">Invoice Checkout</span>
