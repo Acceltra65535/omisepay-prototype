@@ -37,6 +37,9 @@ interface ChargeResult {
   paid: boolean;
   authorize_uri: string | null;
   authenticated_by?: string | null;
+  three_ds_verified?: boolean;
+  payment_method?: string;
+  reversed?: boolean;
   failure_code: string | null;
   failure_message: string | null;
   customer_id?: string | null;
@@ -78,6 +81,7 @@ declare global {
           state?: string;
           postal_code?: string;
           country?: string;
+          email?: string;
           phone_number?: string;
         },
         callback: (statusCode: number, response: any) => void,
@@ -177,6 +181,14 @@ function getCountryDialCode(countryCode: string): string {
   return dialCodes[code] || '+1';
 }
 
+function normalizeInternationalPhone(raw: string): string {
+  const cleaned = raw.trim().replace(/[\s\-().]/g, '');
+  if (cleaned.startsWith('00')) {
+    return '+' + cleaned.slice(2);
+  }
+  return cleaned;
+}
+
 function randomInt(max: number): number {
   if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.getRandomValues === 'function') {
     const arr = new Uint32Array(1);
@@ -239,6 +251,7 @@ export const PaymentForm = () => {
   const [isThirdPartyCard, setIsThirdPartyCard] = useState(false);
   const [cardholderName, setCardholderName] = useState('');
   const [cardholderEmail, setCardholderEmail] = useState('');
+  const [cardholderPhone, setCardholderPhone] = useState('');
   const [cardNumber, setCardNumber] = useState('');
   const [expiry, setExpiry] = useState('');
   const [cvc, setCvc] = useState('');
@@ -285,6 +298,13 @@ export const PaymentForm = () => {
     const amt = parseFloat(amount || '0');
     return country === 'US' || country === 'CA' || amt >= 1000;
   }, [amount, country]);
+
+  const nameDiffersFromCustomer = Boolean(
+    customerName.trim() &&
+    cardholderName.trim() &&
+    customerName.trim().toLowerCase() !== cardholderName.trim().toLowerCase(),
+  );
+  const showCardholderEmailField = isThirdPartyCard || nameDiffersFromCustomer;
 
   // Dynamic cross-currency reference (uses live FX rates from /api/config with safe fallback)
   const currencyReference = useMemo(() => {
@@ -414,10 +434,10 @@ export const PaymentForm = () => {
       if (data.status === 'successful' && data.paid) {
         setStatus('success');
         sessionStorage.removeItem('omise_last_charge_id');
-      } else if (data.status === 'failed') {
+      } else if (data.status === 'failed' || data.status === 'reversed') {
         setError(
           data.failure_message ||
-          `Payment declined (${data.failure_code || 'transaction_declined'})`,
+          `Payment declined (${data.failure_code || (data.status === 'reversed' ? 'three_ds_authentication_required' : 'transaction_declined')})`,
         );
         setStatus('failed');
         sessionStorage.removeItem('omise_last_charge_id');
@@ -519,98 +539,107 @@ export const PaymentForm = () => {
       errors.cardholderName = 'Cardholder name is too short';
     }
 
-    if (isThirdPartyCard && cardholderEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail.trim())) {
-      errors.cardholderEmail = 'Please enter a valid cardholder email address';
-    }
+      if (showCardholderEmailField && cardholderEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail.trim())) {
+        errors.cardholderEmail = 'Please enter a valid cardholder email address';
+      }
 
-    // 4. Card Number
-    const rawCard = cardNumber.replace(/\D/g, '');
-    if (!rawCard) {
-      errors.cardNumber = 'Card number is required';
-    } else if (rawCard.length < 13 || rawCard.length > 19) {
-      errors.cardNumber = 'Invalid card number (13-19 digits required)';
-    } else if (!(ACCEPTED_CARD_BRANDS as readonly string[]).includes(cardBrand)) {
-      errors.cardNumber = `This card type is not supported. Please use a ${ACCEPTED_BRANDS_LABEL} card.`;
-    } else if (!isCardBrandSupportedForCurrency(cardBrand, currency)) {
-      // Omise Multi-currency (non-SGD charges) only supports Visa / Mastercard.
-      errors.cardNumber = `JCB cards are only supported for SGD payments. For ${currency.toUpperCase()}, please use a Visa or Mastercard (or switch currency to SGD).`;
-    }
-
-    // 5. Expiration Date
-    const expiryParts = expiry.split('/');
-    if (expiryParts.length !== 2) {
-      errors.expiry = 'Invalid expiry format (MM/YY)';
-    } else {
-      const month = parseInt(expiryParts[0]!, 10);
-      const year = parseInt(expiryParts[1]!, 10);
-      if (isNaN(month) || month < 1 || month > 12) {
-        errors.expiry = 'Invalid expiry month (01-12)';
-      } else {
-        const now = new Date();
-        const currentYear = now.getFullYear() % 100;
-        const currentMonth = now.getMonth() + 1;
-        if (year < currentYear || (year === currentYear && month < currentMonth)) {
-          errors.expiry = 'Card has expired';
-        } else if (year > currentYear + 25) {
-          errors.expiry = 'Invalid expiry year';
+      if (cardholderPhone.trim()) {
+        const normalizedPhone = normalizeInternationalPhone(cardholderPhone);
+        if (!/^\+[1-9]\d{6,14}$/.test(normalizedPhone)) {
+          errors.cardholderPhone = `Please enter an international phone number starting with + (e.g. ${getCountryDialCode(country)} 8123 4567)`;
         }
       }
-    }
 
-    // 6. CVC / CVV
-    const rawCvc = cvc.replace(/\D/g, '');
-    const requiredCvcLen = cardBrand === 'amex' ? 4 : 3;
-    if (!rawCvc) {
-      errors.cvc = 'CVC code is required';
-    } else if (rawCvc.length < requiredCvcLen) {
-      errors.cvc = `${cardBrand === 'amex' ? '4' : '3'}-digit CVC required`;
-    }
+      // 4. Card Number
+      const rawCard = cardNumber.replace(/\D/g, '');
+      if (!rawCard) {
+        errors.cardNumber = 'Card number is required';
+      } else if (rawCard.length < 13 || rawCard.length > 19) {
+        errors.cardNumber = 'Invalid card number (13-19 digits required)';
+      } else if (!(ACCEPTED_CARD_BRANDS as readonly string[]).includes(cardBrand)) {
+        errors.cardNumber = `This card type is not supported. Please use a ${ACCEPTED_BRANDS_LABEL} card.`;
+      } else if (!isCardBrandSupportedForCurrency(cardBrand, currency)) {
+        // Omise Multi-currency (non-SGD charges) only supports Visa / Mastercard.
+        errors.cardNumber = `JCB cards are only supported for SGD payments. For ${currency.toUpperCase()}, please use a Visa or Mastercard (or switch currency to SGD).`;
+      }
 
-    // 7. Strict International AVS Address Validation
-    const avsResult = validateAvsAddress(
-      {
-        country,
-        street1,
-        street2,
-        city,
-        state,
-        postalCode,
-      },
+      // 5. Expiration Date
+      const expiryParts = expiry.split('/');
+      if (expiryParts.length !== 2) {
+        errors.expiry = 'Invalid expiry format (MM/YY)';
+      } else {
+        const month = parseInt(expiryParts[0]!, 10);
+        const year = parseInt(expiryParts[1]!, 10);
+        if (isNaN(month) || month < 1 || month > 12) {
+          errors.expiry = 'Invalid expiry month (01-12)';
+        } else {
+          const now = new Date();
+          const currentYear = now.getFullYear() % 100;
+          const currentMonth = now.getMonth() + 1;
+          if (year < currentYear || (year === currentYear && month < currentMonth)) {
+            errors.expiry = 'Card has expired';
+          } else if (year > currentYear + 25) {
+            errors.expiry = 'Invalid expiry year';
+          }
+        }
+      }
+
+      // 6. CVC / CVV
+      const rawCvc = cvc.replace(/\D/g, '');
+      const requiredCvcLen = cardBrand === 'amex' ? 4 : 3;
+      if (!rawCvc) {
+        errors.cvc = 'CVC code is required';
+      } else if (rawCvc.length < requiredCvcLen) {
+        errors.cvc = `${cardBrand === 'amex' ? '4' : '3'}-digit CVC required`;
+      }
+
+      // 7. Strict International AVS Address Validation
+      const avsResult = validateAvsAddress(
+        {
+          country,
+          street1,
+          street2,
+          city,
+          state,
+          postalCode,
+        },
+        countryConfig,
+      );
+
+      if (!avsResult.isValid) {
+        Object.assign(errors, avsResult.errors);
+      }
+
+      const errorKeys = Object.keys(errors);
+      const valid = errorKeys.length === 0;
+      const mainError = valid ? undefined : errors[errorKeys[0]!];
+
+      return { valid, mainError, errors };
+    }, [
+      amount,
+      customerName,
+      customerEmail,
+      country,
+      isHighValue,
+      invoiceNumber,
+      cardholderName,
+      cardholderEmail,
+      isThirdPartyCard,
+      cardholderPhone,
+      showCardholderEmailField,
+      cardNumber,
+      expiry,
+      cvc,
+      cardBrand,
+      street1,
+      street2,
+      city,
+      state,
+      postalCode,
       countryConfig,
-    );
-
-    if (!avsResult.isValid) {
-      Object.assign(errors, avsResult.errors);
-    }
-
-    const errorKeys = Object.keys(errors);
-    const valid = errorKeys.length === 0;
-    const mainError = valid ? undefined : errors[errorKeys[0]!];
-
-    return { valid, mainError, errors };
-  }, [
-    amount,
-    customerName,
-    customerEmail,
-    country,
-    isHighValue,
-    invoiceNumber,
-    cardholderName,
-    cardholderEmail,
-    isThirdPartyCard,
-    cardNumber,
-    expiry,
-    cvc,
-    cardBrand,
-    street1,
-    street2,
-    city,
-    state,
-    postalCode,
-    countryConfig,
-    currency,
-    currencyConfig,
-  ]);
+      currency,
+      currencyConfig,
+    ]);
 
   // ── Apple Pay Flow ─────────────────────────────────────────
 
@@ -630,122 +659,132 @@ export const PaymentForm = () => {
       return;
     }
     if (isThirdPartyCard && cardholderEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail.trim())) {
-      setError('Please enter a valid cardholder email address before using Apple Pay.');
-      return;
-    }
+      if (showCardholderEmailField && cardholderEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail.trim())) {
+        setError('Please enter a valid cardholder email address before using Apple Pay.');
+        return;
+      }
+      const normalizedApplePayPhone = cardholderPhone.trim()
+        ? normalizeInternationalPhone(cardholderPhone)
+        : '';
+      if (normalizedApplePayPhone && !/^\+[1-9]\d{6,14}$/.test(normalizedApplePayPhone)) {
+        setError(`Please enter a valid international cardholder phone number starting with + (e.g. ${getCountryDialCode(country)} 8123 4567).`);
+        return;
+      }
 
-    const request = {
-      countryCode: 'SG',
-      currencyCode: currency.toUpperCase(),
-      // Omise Multi-currency only accepts Visa / Mastercard, so JCB is offered for SGD only.
-      supportedNetworks: [...currencyConfig.applePayNetworks],
-      merchantCapabilities: ['supports3DS', 'supportsCredit', 'supportsDebit'],
-      total: { label: 'Omise Pay', amount: amt.toFixed(2) },
-    };
-
-    try {
-      const session = new (window as any).ApplePaySession(3, request);
-
-      session.onvalidatemerchant = async (event: any) => {
-        try {
-          const res = await fetch('/api/applepay/validate-merchant', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ validationUrl: event.validationURL }),
-          });
-          const merchantSession = await res.json();
-          if (!res.ok) throw new Error(merchantSession.error || 'Merchant validation failed');
-          session.completeMerchantValidation(merchantSession);
-        } catch (err: any) {
-          console.error('Apple Pay Merchant Validation Error:', err);
-          session.abort();
-          setError(err.message || 'Apple Pay Merchant Validation Failed. 请在 .env 中配置 APPLE_MERCHANT_ID、APPLE_MERCHANT_CERT_PATH、APPLE_MERCHANT_KEY_PATH。');
-          setStatus('idle');
-        }
+      const request = {
+        countryCode: 'SG',
+        currencyCode: currency.toUpperCase(),
+        // Omise Multi-currency only accepts Visa / Mastercard, so JCB is offered for SGD only.
+        supportedNetworks: [...currencyConfig.applePayNetworks],
+        merchantCapabilities: ['supports3DS', 'supportsCredit', 'supportsDebit'],
+        total: { label: 'Omise Pay', amount: amt.toFixed(2) },
       };
 
-      session.onpaymentauthorized = async (event: any) => {
-        try {
-          setStatus('tokenizing');
+      try {
+        const session = new (window as any).ApplePaySession(3, request);
 
-          // Tokenize Apple Pay with Omise Vault.
-          // Omise requires tokenization[method], tokenization[data], tokenization[merchant_id]
-          // (the Apple Pay Merchant ID registered with Omise, e.g. merchant.omise.sg.prod) and
-          // tokenization[brand] (the network the customer picked in the sheet, e.g. "Visa").
-          // Without brand, the resulting card has no brand and Omise rejects it as "brand not supported".
-          const token = await new Promise<string>(async (resolve, reject) => {
-            try {
-              const pk = publicKeyRef.current;
-              if (!pk) {
-                return reject(new Error('Omise Public Key not loaded for Apple Pay'));
-              }
-              const merchantId = applePayMerchantIdRef.current;
-              if (!merchantId) {
-                return reject(
-                  new Error('Apple Pay Merchant ID is not configured. 请在 .env 中设置 APPLE_MERCHANT_ID 并重启服务。'),
+        session.onvalidatemerchant = async (event: any) => {
+          try {
+            const res = await fetch('/api/applepay/validate-merchant', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ validationUrl: event.validationURL }),
+            });
+            const merchantSession = await res.json();
+            if (!res.ok) throw new Error(merchantSession.error || 'Merchant validation failed');
+            session.completeMerchantValidation(merchantSession);
+          } catch (err: any) {
+            console.error('Apple Pay Merchant Validation Error:', err);
+            session.abort();
+            setError(err.message || 'Apple Pay Merchant Validation Failed. 请在 .env 中配置 APPLE_MERCHANT_ID、APPLE_MERCHANT_CERT_PATH、APPLE_MERCHANT_KEY_PATH。');
+            setStatus('idle');
+          }
+        };
+
+        session.onpaymentauthorized = async (event: any) => {
+          try {
+            setStatus('tokenizing');
+
+            // Tokenize Apple Pay with Omise Vault.
+            // Omise requires tokenization[method], tokenization[data], tokenization[merchant_id]
+            // (the Apple Pay Merchant ID registered with Omise, e.g. merchant.omise.sg.prod) and
+            // tokenization[brand] (the network the customer picked in the sheet, e.g. "Visa").
+            // Without brand, the resulting card has no brand and Omise rejects it as "brand not supported".
+            const token = await new Promise<string>(async (resolve, reject) => {
+              try {
+                const pk = publicKeyRef.current;
+                if (!pk) {
+                  return reject(new Error('Omise Public Key not loaded for Apple Pay'));
+                }
+                const merchantId = applePayMerchantIdRef.current;
+                if (!merchantId) {
+                  return reject(
+                    new Error('Apple Pay Merchant ID is not configured. 请在 .env 中设置 APPLE_MERCHANT_ID 并重启服务。'),
+                  );
+                }
+                const paymentData = event.payment.token.paymentData;
+                const formData = new URLSearchParams();
+                formData.append('tokenization[method]', 'applepay');
+                formData.append('tokenization[merchant_id]', merchantId);
+                // Apple Pay reports "Visa" / "MasterCard" / "JCB", which match Omise's brand names.
+                formData.append('tokenization[brand]', event.payment.token.paymentMethod?.network || '');
+                formData.append(
+                  'tokenization[data]',
+                  typeof paymentData === 'string' ? paymentData : JSON.stringify(paymentData),
                 );
+                const vaultRes = await fetch('https://vault.omise.co/tokens', {
+                  method: 'POST',
+                  headers: {
+                    Authorization: 'Basic ' + btoa(pk + ':'),
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                  },
+                  body: formData.toString(),
+                });
+                const vaultData = await vaultRes.json();
+                if (vaultRes.ok && vaultData.id) {
+                  resolve(vaultData.id);
+                } else {
+                  reject(new Error(vaultData.message || 'Apple Pay tokenization failed'));
+                }
+              } catch (vaultErr: any) {
+                reject(new Error(vaultErr.message || 'Apple Pay tokenization network error'));
               }
-              const paymentData = event.payment.token.paymentData;
-              const formData = new URLSearchParams();
-              formData.append('tokenization[method]', 'applepay');
-              formData.append('tokenization[merchant_id]', merchantId);
-              // Apple Pay reports "Visa" / "MasterCard" / "JCB", which match Omise's brand names.
-              formData.append('tokenization[brand]', event.payment.token.paymentMethod?.network || '');
-              formData.append(
-                'tokenization[data]',
-                typeof paymentData === 'string' ? paymentData : JSON.stringify(paymentData),
-              );
-              const vaultRes = await fetch('https://vault.omise.co/tokens', {
-                method: 'POST',
-                headers: {
-                  Authorization: 'Basic ' + btoa(pk + ':'),
-                  'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: formData.toString(),
-              });
-              const vaultData = await vaultRes.json();
-              if (vaultRes.ok && vaultData.id) {
-                resolve(vaultData.id);
-              } else {
-                reject(new Error(vaultData.message || 'Apple Pay tokenization failed'));
-              }
-            } catch (vaultErr: any) {
-              reject(new Error(vaultErr.message || 'Apple Pay tokenization network error'));
-            }
-          });
+            });
 
-          setStatus('charging');
-          const amountInCents = Math.round(amt * 100);
-          const clientRef = 'om_ref_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
-          const returnUri = window.location.origin + window.location.pathname + '?ref=' + clientRef;
-          const applePayNetwork = String(event.payment.token.paymentMethod?.network || '').toLowerCase();
+            setStatus('charging');
+            const amountInCents = Math.round(amt * 100);
+            const clientRef = 'om_ref_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+            const returnUri = window.location.origin + window.location.pathname + '?ref=' + clientRef;
+            const applePayNetwork = String(event.payment.token.paymentMethod?.network || '').toLowerCase();
 
-          const chargeResponse = await fetch('/api/charge', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              token,
-              amount: amountInCents,
-              currency: currency,
-              return_uri: returnUri,
-              client_ref: clientRef,
-              is_apple_pay: true,
-              card_brand: applePayNetwork || undefined,
-              customer:
-                customerName.trim() || customerEmail.trim()
-                  ? {
+            const chargeResponse = await fetch('/api/charge', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                token,
+                amount: amountInCents,
+                currency: currency,
+                return_uri: returnUri,
+                client_ref: clientRef,
+                is_apple_pay: true,
+                card_brand: applePayNetwork || undefined,
+                customer:
+                  customerName.trim() || customerEmail.trim()
+                    ? {
                       name: customerName.trim() || undefined,
                       email: customerEmail.trim() || undefined,
                     }
-                  : undefined,
-              payer: {
-                is_third_party_card: isThirdPartyCard,
-                cardholder_email:
-                  isThirdPartyCard && cardholderEmail.trim()
-                    ? cardholderEmail.trim()
                     : undefined,
+                payer: {
+                  is_third_party_card: isThirdPartyCard,
+                  cardholder_email:
+                    isThirdPartyCard && cardholderEmail.trim()
+                  showCardholderEmailField && cardholderEmail.trim()
+                  ? cardholderEmail.trim()
+                  : undefined,
+                cardholder_phone: normalizedApplePayPhone || undefined,
               },
-              invoice: {
+                invoice: {
                 invoice_number: invoiceNumber.trim() || undefined,
                 description: invoiceDescription.trim() || undefined,
               },
@@ -837,6 +876,14 @@ export const PaymentForm = () => {
           countryConfig,
         );
 
+        const effectiveThirdParty = isThirdPartyCard || nameDiffersFromCustomer;
+        const tokenCardholderEmail = effectiveThirdParty
+          ? cardholderEmail.trim() || undefined
+          : customerEmail.trim() || undefined;
+        const normalizedPhone = cardholderPhone.trim()
+          ? normalizeInternationalPhone(cardholderPhone)
+          : '';
+
         const tokenCardData: Record<string, string | number> = {
           name: cardholderName.trim(),
           number: digits,
@@ -848,6 +895,12 @@ export const PaymentForm = () => {
           city: normalizedAddress.city,
         };
 
+        if (tokenCardholderEmail) {
+          tokenCardData.email = tokenCardholderEmail;
+        }
+        if (normalizedPhone) {
+          tokenCardData.phone_number = normalizedPhone;
+        }
         if (normalizedAddress.street2) {
           tokenCardData.street2 = normalizedAddress.street2;
         }
@@ -909,901 +962,985 @@ export const PaymentForm = () => {
               cardholder_name: cardholderName.trim(),
               cardholder_email:
                 isThirdPartyCard && cardholderEmail.trim()
-                  ? cardholderEmail.trim()
-                  : undefined,
-              is_third_party_card: effectiveThirdParty,
-            },
+                effectiveThirdParty && cardholderEmail.trim()
+              ? cardholderEmail.trim()
+              : undefined,
+            cardholder_phone: normalizedPhone || undefined,
+            is_third_party_card: effectiveThirdParty,
+          },
             invoice: {
-              invoice_number: invoiceNumber.trim(),
-              description: invoiceDescription.trim() || undefined,
-            },
+            invoice_number: invoiceNumber.trim(),
+            description: invoiceDescription.trim() || undefined,
+          },
             billing: normalizedAddress,
           }),
-        });
+      });
 
-        const chargeData: ChargeResult = await chargeResponse.json();
+  const chargeData: ChargeResult = await chargeResponse.json();
 
-        if (!chargeResponse.ok) {
-          throw new Error(
-            (chargeData as any).error || 'Payment processing failed',
-          );
-        }
+  if (!chargeResponse.ok) {
+    throw new Error(
+      (chargeData as any).error || 'Payment processing failed',
+    );
+  }
 
-        // Step 3: Handle result / mandatory 3D Secure redirection
-        if (chargeData.authorize_uri && (!chargeData.paid || chargeData.status === 'pending')) {
-          setStatus('awaiting_3ds');
-          sessionStorage.setItem('omise_last_charge_id', chargeData.id);
-          const redirectUri = chargeData.authorize_uri;
-          setTimeout(() => {
-            window.location.href = redirectUri;
-          }, 800);
-        } else if (chargeData.status === 'successful' && chargeData.paid) {
-          setChargeResult(chargeData);
-          setStatus('success');
-        } else if (chargeData.status === 'failed') {
-          throw new Error(
-            chargeData.failure_message ||
-            `Payment declined (${chargeData.failure_code || 'declined'})`,
-          );
-        } else {
-          throw new Error(`Unexpected charge status: ${chargeData.status}`);
-        }
-      } catch (err: any) {
-        setError(friendlyBrandError(err.message || 'An unexpected error occurred during payment.', currency));
-        setStatus('idle');
-      }
+  // Step 3: Handle result / mandatory 3D Secure redirection
+  if (chargeData.authorize_uri && (!chargeData.paid || chargeData.status === 'pending')) {
+    setStatus('awaiting_3ds');
+    sessionStorage.setItem('omise_last_charge_id', chargeData.id);
+    const redirectUri = chargeData.authorize_uri;
+    setTimeout(() => {
+      window.location.href = redirectUri;
+    }, 800);
+  } else if (chargeData.status === 'successful' && chargeData.paid) {
+    setChargeResult(chargeData);
+    setStatus('success');
+  } else if (chargeData.status === 'failed') {
+  } else if (chargeData.status === 'failed' || chargeData.status === 'reversed') {
+    throw new Error(
+      chargeData.failure_message ||
+      `Payment declined (${chargeData.failure_code || 'declined'})`,
+      `Payment declined (${chargeData.failure_code || (chargeData.status === 'reversed' ? 'three_ds_authentication_required' : 'declined')})`,
+    );
+  } else {
+    throw new Error(`Unexpected charge status: ${chargeData.status}`);
+  }
+} catch (err: any) {
+  setError(friendlyBrandError(err.message || 'An unexpected error occurred during payment.', currency));
+  setStatus('idle');
+}
     },
-    [
-      customerName,
-      customerEmail,
-      cardholderName,
-      cardholderEmail,
-      isThirdPartyCard,
-      cardNumber,
-      cardBrand,
-      expiry,
-      cvc,
-      amount,
-      invoiceNumber,
-      invoiceDescription,
-      country,
-      street1,
-      street2,
-      city,
-      state,
-      postalCode,
-      countryConfig,
-      omiseLoaded,
-      currency,
-      validateForm,
-    ],
+[
+  customerName,
+  customerEmail,
+  cardholderName,
+  cardholderEmail,
+  cardholderPhone,
+  isThirdPartyCard,
+  nameDiffersFromCustomer,
+  cardNumber,
+  cardBrand,
+  expiry,
+  cvc,
+  amount,
+  invoiceNumber,
+  invoiceDescription,
+  country,
+  street1,
+  street2,
+  city,
+  state,
+  postalCode,
+  countryConfig,
+  omiseLoaded,
+  currency,
+  validateForm,
+],
   );
 
-  const handleReset = () => {
-    setInvoiceNumber(generateOrderNumber());
-    setCustomerName('');
-    setCustomerEmail('');
-    setIsThirdPartyCard(false);
-    setCardholderName('');
-    setCardholderEmail('');
-    setCardNumber('');
-    setExpiry('');
-    setCvc('');
-    setAmount('1500.00');
-    setCountry('US');
-    setStreet1('');
-    setStreet2('');
-    setCity('');
-    setState('');
-    setPostalCode('');
-    setStatus('idle');
-    setError('');
-    setFieldErrors({});
-    setChargeResult(null);
-  };
+const handleReset = () => {
+  setInvoiceNumber(generateOrderNumber());
+  setCustomerName('');
+  setCustomerEmail('');
+  setIsThirdPartyCard(false);
+  setCardholderName('');
+  setCardholderEmail('');
+  setCardholderPhone('');
+  setCardNumber('');
+  setExpiry('');
+  setCvc('');
+  setAmount('1500.00');
+  setCountry('US');
+  setStreet1('');
+  setStreet2('');
+  setCity('');
+  setState('');
+  setPostalCode('');
+  setStatus('idle');
+  setError('');
+  setFieldErrors({});
+  setChargeResult(null);
+};
 
-  const isProcessing = status === 'tokenizing' || status === 'charging';
+const isProcessing = status === 'tokenizing' || status === 'charging';
 
-  // Base styling for form inputs
-  const getInputClass = (fieldName: string) => {
-    const hasError = Boolean(fieldErrors[fieldName]);
-    return `w-full rounded-xl border ${hasError
-        ? 'border-red-400 bg-red-50/20 text-red-900 focus:border-red-500 focus:ring-red-100'
-        : 'border-slate-200 bg-slate-50/50 text-slate-800 focus:border-indigo-400 focus:bg-white focus:ring-indigo-100'
-      } px-4 py-3 text-sm transition-all placeholder:text-slate-400 focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60`;
-  };
+// Base styling for form inputs
+const getInputClass = (fieldName: string) => {
+  const hasError = Boolean(fieldErrors[fieldName]);
+  return `w-full rounded-xl border ${hasError
+    ? 'border-red-400 bg-red-50/20 text-red-900 focus:border-red-500 focus:ring-red-100'
+    : 'border-slate-200 bg-slate-50/50 text-slate-800 focus:border-indigo-400 focus:bg-white focus:ring-indigo-100'
+    } px-4 py-3 text-sm transition-all placeholder:text-slate-400 focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60`;
+};
 
-  // ── Render: Verifying (after 3DS callback) ─────────────────
+// ── Render: Verifying (after 3DS callback) ─────────────────
 
-  if (status === 'verifying') {
-    return (
-      <div className="mx-auto w-full max-w-xl">
-        <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-xl">
-          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-indigo-50">
-            <svg className="h-8 w-8 animate-spin text-indigo-600" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-            </svg>
-          </div>
-          <h3 className="mb-2 text-xl font-bold text-slate-800">Verifying Bank Authorization</h3>
-          <p className="text-sm text-slate-500">
-            Confirming 3D Secure 2.0 authorization with your card issuer…
-          </p>
+if (status === 'verifying') {
+  return (
+    <div className="mx-auto w-full max-w-xl">
+      <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-xl">
+        <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-indigo-50">
+          <svg className="h-8 w-8 animate-spin text-indigo-600" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+          </svg>
         </div>
+        <h3 className="mb-2 text-xl font-bold text-slate-800">Verifying Bank Authorization</h3>
+        <p className="text-sm text-slate-500">
+          Confirming 3D Secure 2.0 authorization with your card issuer…
+        </p>
       </div>
-    );
-  }
+    </div>
+  );
+}
 
-  // ── Render: Awaiting 3DS Redirect ──────────────────────────
+// ── Render: Awaiting 3DS Redirect ──────────────────────────
 
-  if (status === 'awaiting_3ds') {
-    return (
-      <div className="mx-auto w-full max-w-xl">
-        <div className="rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-blue-50 p-8 text-center shadow-xl">
-          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-indigo-100">
-            <svg className="h-8 w-8 animate-spin text-indigo-600" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-            </svg>
-          </div>
-          <h3 className="mb-2 text-xl font-bold text-indigo-800">
-            3D Secure 2.0 Identity Verification
-          </h3>
-          <p className="text-sm text-indigo-600">
-            Connecting to your card issuer bank for authentication…
-          </p>
-          <p className="mt-3 text-xs text-slate-500">
-            Please do not close or refresh this window.
-          </p>
+if (status === 'awaiting_3ds') {
+  return (
+    <div className="mx-auto w-full max-w-xl">
+      <div className="rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 to-blue-50 p-8 text-center shadow-xl">
+        <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-indigo-100">
+          <svg className="h-8 w-8 animate-spin text-indigo-600" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+          </svg>
         </div>
+        <h3 className="mb-2 text-xl font-bold text-indigo-800">
+          3D Secure 2.0 Identity Verification
+        </h3>
+        <p className="text-sm text-indigo-600">
+          Connecting to your card issuer bank for authentication…
+        </p>
+        <p className="mt-3 text-xs text-slate-500">
+          Please do not close or refresh this window.
+        </p>
       </div>
-    );
-  }
+    </div>
+  );
+}
 
-  // ── Render: Success (Stripe Invoicing Style Receipt) ───────
+// ── Render: Success (Stripe Invoicing Style Receipt) ───────
 
-  if (status === 'success' && chargeResult) {
-    return (
-      <div className="mx-auto w-full max-w-xl">
-        <div className="rounded-2xl border border-emerald-200 bg-white p-6 sm:p-8 text-left shadow-2xl">
-          {/* Header & Paid Stamp */}
-          <div className="mb-6 flex items-start justify-between border-b border-slate-100 pb-5">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700">
-                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                  </svg>
+if (status === 'success' && chargeResult) {
+  return (
+    <div className="mx-auto w-full max-w-xl">
+      <div className="rounded-2xl border border-emerald-200 bg-white p-6 sm:p-8 text-left shadow-2xl">
+        {/* Header & Paid Stamp */}
+        <div className="mb-6 flex items-start justify-between border-b border-slate-100 pb-5">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700">
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
+              </span>
+              <h3 className="text-xl font-bold text-slate-800">Payment Receipt</h3>
+            </div>
+            <p className="mt-1 text-xs text-slate-500 font-mono">
+              {chargeResult.invoice_number || invoiceNumber} · {new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}
+            </p>
+          </div>
+          <div className="rounded-lg border-2 border-emerald-600 bg-emerald-50 px-3 py-1 text-center font-bold uppercase tracking-wider text-emerald-700 text-sm">
+            PAID ✓
+          </div>
+        </div>
+
+        {/* Amount Summary */}
+        {(() => {
+          const resCurr = (chargeResult.currency || currency).toLowerCase() as SupportedCurrency;
+          const resCfg = SUPPORTED_CURRENCIES[resCurr] || SUPPORTED_CURRENCIES.sgd;
+          return (
+            <div className="mb-6 rounded-xl bg-slate-50 p-4 border border-slate-100">
+              <span className="text-xs uppercase font-semibold text-slate-400">Total Amount Paid</span>
+              <div className="mt-1 flex items-baseline gap-2">
+                <span className="text-3xl font-extrabold text-slate-900">
+                  {resCfg.symbol}{(chargeResult.amount / 100).toFixed(2)}
                 </span>
-                <h3 className="text-xl font-bold text-slate-800">Payment Receipt</h3>
+                <span className="text-sm font-semibold text-slate-500">{resCfg.code.toUpperCase()}</span>
               </div>
-              <p className="mt-1 text-xs text-slate-500 font-mono">
-                {chargeResult.invoice_number || invoiceNumber} · {new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}
-              </p>
+              {currencyReference && (
+                <p className="mt-1 text-xs text-slate-500">
+                  {currencyReference.text}
+                </p>
+              )}
             </div>
-            <div className="rounded-lg border-2 border-emerald-600 bg-emerald-50 px-3 py-1 text-center font-bold uppercase tracking-wider text-emerald-700 text-sm">
-              PAID ✓
-            </div>
-          </div>
+          );
+        })()}
 
-          {/* Amount Summary */}
-          {(() => {
-            const resCurr = (chargeResult.currency || currency).toLowerCase() as SupportedCurrency;
-            const resCfg = SUPPORTED_CURRENCIES[resCurr] || SUPPORTED_CURRENCIES.sgd;
-            return (
-              <div className="mb-6 rounded-xl bg-slate-50 p-4 border border-slate-100">
-                <span className="text-xs uppercase font-semibold text-slate-400">Total Amount Paid</span>
-                <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-3xl font-extrabold text-slate-900">
-                    {resCfg.symbol}{(chargeResult.amount / 100).toFixed(2)}
+        {/* Invoice & Customer Details Table */}
+        <div className="mb-6 space-y-3 rounded-xl border border-slate-100 bg-slate-50/50 p-4 text-xs sm:text-sm">
+          <div className="flex justify-between py-1 border-b border-slate-100">
+            <span className="text-slate-500">Invoice Reference</span>
+            <span className="font-mono font-medium text-slate-800">
+              {chargeResult.invoice_number || invoiceNumber}
+            </span>
+          </div>
+          <div className="flex justify-between py-1 border-b border-slate-100">
+            <span className="text-slate-500">Description</span>
+            <span className="text-slate-800 font-medium">
+              {chargeResult.invoice_description || invoiceDescription}
+            </span>
+          </div>
+          {chargeResult.customer_id && (
+            <div className="flex justify-between py-1 border-b border-slate-100">
+              <span className="text-slate-500">Omise Customer Entity</span>
+              <span className="font-mono text-xs text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">
+                {chargeResult.customer_id}
+              </span>
+            </div>
+          )}
+          <div className="flex justify-between py-1 border-b border-slate-100">
+            <span className="text-slate-500">Customer Name</span>
+            <span className="text-slate-800 font-medium">
+              {chargeResult.customer?.name || customerName || '—'}
+            </span>
+          </div>
+          <div className="flex justify-between py-1 border-b border-slate-100">
+            <span className="text-slate-500">Customer Email</span>
+            <span className="text-slate-800">
+              {chargeResult.customer?.email || customerEmail || '—'}
+            </span>
+          </div>
+          {(chargeResult.payer?.cardholder_name || chargeResult.card?.name || cardholderName) && (
+            <div className="flex justify-between items-center py-1 border-b border-slate-100">
+              <span className="text-slate-500">Cardholder Name</span>
+              <span className="flex items-center gap-2 text-slate-800 font-medium">
+                <span>{chargeResult.payer?.cardholder_name || chargeResult.card?.name || cardholderName}</span>
+                {chargeResult.payer?.is_third_party_card && (
+                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+                    Third-Party Card
                   </span>
-                  <span className="text-sm font-semibold text-slate-500">{resCfg.code.toUpperCase()}</span>
-                </div>
-                {currencyReference && (
-                  <p className="mt-1 text-xs text-slate-500">
-                    {currencyReference.text}
-                  </p>
                 )}
-              </div>
-            );
-          })()}
-
-          {/* Invoice & Customer Details Table */}
-          <div className="mb-6 space-y-3 rounded-xl border border-slate-100 bg-slate-50/50 p-4 text-xs sm:text-sm">
-            <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Invoice Reference</span>
-              <span className="font-mono font-medium text-slate-800">
-                {chargeResult.invoice_number || invoiceNumber}
               </span>
             </div>
+          )}
+          {chargeResult.payer?.cardholder_email && (
             <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Description</span>
-              <span className="text-slate-800 font-medium">
-                {chargeResult.invoice_description || invoiceDescription}
-              </span>
-            </div>
-            {chargeResult.customer_id && (
-              <div className="flex justify-between py-1 border-b border-slate-100">
-                <span className="text-slate-500">Omise Customer Entity</span>
-                <span className="font-mono text-xs text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">
-                  {chargeResult.customer_id}
-                </span>
-              </div>
-            )}
-            <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Customer Name</span>
-              <span className="text-slate-800 font-medium">
-                {chargeResult.customer?.name || customerName || '—'}
-              </span>
-            </div>
-            <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Customer Email</span>
+              <span className="text-slate-500">Cardholder Email</span>
               <span className="text-slate-800">
-                {chargeResult.customer?.email || customerEmail || '—'}
+                {chargeResult.payer.cardholder_email}
               </span>
             </div>
-            {(chargeResult.payer?.cardholder_name || chargeResult.card?.name || cardholderName) && (
-              <div className="flex justify-between items-center py-1 border-b border-slate-100">
-                <span className="text-slate-500">Cardholder Name</span>
-                <span className="flex items-center gap-2 text-slate-800 font-medium">
-                  <span>{chargeResult.payer?.cardholder_name || chargeResult.card?.name || cardholderName}</span>
-                  {chargeResult.payer?.is_third_party_card && (
-                    <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
-                      Third-Party Card
-                    </span>
-                  )}
+          )}
+          <div className="flex justify-between py-1 border-b border-slate-100">
+            <span className="text-slate-500">Transaction ID</span>
+            <span className="font-mono text-xs text-slate-700">
+              {chargeResult.id}
+            </span>
+          </div>
+          <div className="flex justify-between py-1 border-b border-slate-100">
+            <span className="text-slate-500">Authentication</span>
+            <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+              ✓ {chargeResult.authenticated_by ? chargeResult.authenticated_by : '3D Secure 2.0 Verified'}
+            </span>
+            {(() => {
+              const authUpper = (chargeResult.authenticated_by || '').toUpperCase();
+              if (authUpper === '3DS') {
+                return (
+                  <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                    ✓ 3D Secure 2.0 (3DS)
+                  </span>
+                );
+              }
+              if (authUpper === 'PASSKEY') {
+                return (
+                  <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                    ✓ Passkey (3DS2)
+                  </span>
+                );
+              }
+              if (chargeResult.authenticated_by) {
+                return (
+                  <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                    ✓ {chargeResult.authenticated_by}
+                  </span>
+                );
+              }
+              if (chargeResult.payment_method === 'apple_pay') {
+                return (
+                  <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                    ✓ Apple Pay (Device Biometric)
+                  </span>
+                );
+              }
+              return (
+                <span className="inline-flex items-center gap-1 rounded bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-800">
+                  ⚠ Not 3DS Authenticated
                 </span>
-              </div>
-            )}
-            {chargeResult.payer?.cardholder_email && (
-              <div className="flex justify-between py-1 border-b border-slate-100">
-                <span className="text-slate-500">Cardholder Email</span>
-                <span className="text-slate-800">
-                  {chargeResult.payer.cardholder_email}
-                </span>
-              </div>
-            )}
-            <div className="flex justify-between py-1 border-b border-slate-100">
+              );
+            })()}
+          </div>
+          {chargeResult.card && (
+            <div className="flex justify-between py-1">
+              <span className="text-slate-500">Payment Card</span>
+              <span className="text-slate-800 font-medium">
+                {chargeResult.card.brand.toUpperCase()} •••• {chargeResult.card.last_digits}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* Action Buttons */}
+        <div className="flex flex-col sm:flex-row gap-3">
+          <button
+            onClick={() => window.print()}
+            className="flex-1 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition-all hover:bg-slate-50 hover:shadow active:scale-[0.98] text-center"
+          >
+            🖨️ Print Invoice Receipt
+          </button>
+          <button
+            onClick={handleReset}
+            className="flex-1 rounded-xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition-all hover:bg-indigo-700 hover:shadow-lg active:scale-[0.98] text-center"
+          >
+            Pay Another Invoice
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Render: Failed ─────────────────────────────────────────
+
+if (status === 'failed') {
+  return (
+    <div className="mx-auto w-full max-w-xl">
+      <div className="rounded-2xl border border-red-200 bg-gradient-to-br from-red-50 to-orange-50 p-8 text-center shadow-xl">
+        <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-red-100">
+          <svg className="h-8 w-8 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </div>
+        <h3 className="mb-2 text-2xl font-bold text-red-800">
+          Payment Declined by Card Issuer
+        </h3>
+        <p className="mb-4 text-sm text-red-600">{error}</p>
+        {chargeResult && (
+          <div className="mb-6 space-y-2 rounded-xl bg-white/70 p-4 text-left text-sm backdrop-blur-sm">
+            <div className="flex justify-between">
               <span className="text-slate-500">Transaction ID</span>
               <span className="font-mono text-xs text-slate-700">
                 {chargeResult.id}
               </span>
             </div>
-            <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Authentication</span>
-              <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
-                ✓ {chargeResult.authenticated_by ? chargeResult.authenticated_by : '3D Secure 2.0 Verified'}
-              </span>
-            </div>
-            {chargeResult.card && (
-              <div className="flex justify-between py-1">
-                <span className="text-slate-500">Payment Card</span>
-                <span className="text-slate-800 font-medium">
-                  {chargeResult.card.brand.toUpperCase()} •••• {chargeResult.card.last_digits}
+            {chargeResult.failure_code && (
+              <div className="flex justify-between">
+                <span className="text-slate-500">Decline Code</span>
+                <span className="font-mono text-xs text-red-600">
+                  {chargeResult.failure_code}
                 </span>
               </div>
             )}
-          </div>
-
-          {/* Action Buttons */}
-          <div className="flex flex-col sm:flex-row gap-3">
-            <button
-              onClick={() => window.print()}
-              className="flex-1 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition-all hover:bg-slate-50 hover:shadow active:scale-[0.98] text-center"
-            >
-              🖨️ Print Invoice Receipt
-            </button>
-            <button
-              onClick={handleReset}
-              className="flex-1 rounded-xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition-all hover:bg-indigo-700 hover:shadow-lg active:scale-[0.98] text-center"
-            >
-              Pay Another Invoice
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ── Render: Failed ─────────────────────────────────────────
-
-  if (status === 'failed') {
-    return (
-      <div className="mx-auto w-full max-w-xl">
-        <div className="rounded-2xl border border-red-200 bg-gradient-to-br from-red-50 to-orange-50 p-8 text-center shadow-xl">
-          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-red-100">
-            <svg className="h-8 w-8 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </div>
-          <h3 className="mb-2 text-2xl font-bold text-red-800">
-            Payment Declined by Card Issuer
-          </h3>
-          <p className="mb-4 text-sm text-red-600">{error}</p>
-          {chargeResult && (
-            <div className="mb-6 space-y-2 rounded-xl bg-white/70 p-4 text-left text-sm backdrop-blur-sm">
-              <div className="flex justify-between">
-                <span className="text-slate-500">Transaction ID</span>
-                <span className="font-mono text-xs text-slate-700">
-                  {chargeResult.id}
-                </span>
-              </div>
-              {chargeResult.failure_code && (
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Decline Code</span>
-                  <span className="font-mono text-xs text-red-600">
-                    {chargeResult.failure_code}
-                  </span>
-                </div>
-              )}
-            </div>
-          )}
-          <button
-            onClick={handleReset}
-            className="w-full rounded-xl bg-red-600 px-6 py-3 text-sm font-semibold text-white transition-all hover:bg-red-700 hover:shadow-lg active:scale-[0.98]"
-          >
-            Review Details & Try Again
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  // ── Render: Interactive Payment Form ───────────────────────
-
-  return (
-    <div className="mx-auto w-full max-w-xl">
-      <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 shadow-xl shadow-slate-200/50">
-        {/* Configuration Notice */}
-        {isConfigured === false && (
-          <div className="mb-6 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
-            <p className="font-bold">⚠️ Omise Configuration Required</p>
-            <p className="mt-1">
-              Please configure your Omise Live Public & Secret Keys in <code className="rounded bg-amber-100 px-1 font-mono text-xs">.env</code> to activate live processing.
-            </p>
           </div>
         )}
+        <button
+          onClick={handleReset}
+          className="w-full rounded-xl bg-red-600 px-6 py-3 text-sm font-semibold text-white transition-all hover:bg-red-700 hover:shadow-lg active:scale-[0.98]"
+        >
+          Review Details & Try Again
+        </button>
+      </div>
+    </div>
+  );
+}
 
-        {/* Invoice Header Badge (Stripe Invoicing Style) */}
-        <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-5">
-          <div>
-            <div className="flex items-center gap-2">
-              <span
-                suppressHydrationWarning
-                className="rounded-md bg-indigo-100 px-2.5 py-1 text-xs font-bold text-indigo-700 font-mono"
-              >
-                {invoiceNumber}
-              </span>
-              <span className="text-xs text-slate-400">Invoice Checkout</span>
-            </div>
-            <h2 className="mt-1 text-xl font-extrabold text-slate-800">
-              International Payment Portal
-            </h2>
+// ── Render: Interactive Payment Form ───────────────────────
+
+return (
+  <div className="mx-auto w-full max-w-xl">
+    <div className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 shadow-xl shadow-slate-200/50">
+      {/* Configuration Notice */}
+      {isConfigured === false && (
+        <div className="mb-6 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+          <p className="font-bold">⚠️ Omise Configuration Required</p>
+          <p className="mt-1">
+            Please configure your Omise Live Public & Secret Keys in <code className="rounded bg-amber-100 px-1 font-mono text-xs">.env</code> to activate live processing.
+          </p>
+        </div>
+      )}
+
+      {/* Invoice Header Badge (Stripe Invoicing Style) */}
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-5">
+        <div>
+          <div className="flex items-center gap-2">
+            <span
+              suppressHydrationWarning
+              className="rounded-md bg-indigo-100 px-2.5 py-1 text-xs font-bold text-indigo-700 font-mono"
+            >
+              {invoiceNumber}
+            </span>
+            <span className="text-xs text-slate-400">Invoice Checkout</span>
           </div>
-          <div className="text-right">
-            <span className="text-xs text-slate-400">Amount Due</span>
-            <div className="text-lg font-black text-slate-900">
-              {currencyConfig.symbol}{parseFloat(amount || '0').toFixed(2)}{' '}
-              <span className="text-xs font-semibold text-slate-500">{currencyConfig.code.toUpperCase()}</span>
-            </div>
-            {currencyReference && (
-              <span className="text-xs font-medium text-indigo-600 block">
-                {currencyReference.primary}
+          <h2 className="mt-1 text-xl font-extrabold text-slate-800">
+            International Payment Portal
+          </h2>
+        </div>
+        <div className="text-right">
+          <span className="text-xs text-slate-400">Amount Due</span>
+          <div className="text-lg font-black text-slate-900">
+            {currencyConfig.symbol}{parseFloat(amount || '0').toFixed(2)}{' '}
+            <span className="text-xs font-semibold text-slate-500">{currencyConfig.code.toUpperCase()}</span>
+          </div>
+          {currencyReference && (
+            <span className="text-xs font-medium text-indigo-600 block">
+              {currencyReference.primary}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Currency Selector Pill Control */}
+      <div className="mb-6 rounded-2xl bg-gradient-to-r from-slate-50 via-indigo-50/40 to-slate-50 p-4 border border-slate-200/80 shadow-sm">
+        <div className="flex items-center justify-between mb-2.5">
+          <span className="text-xs font-bold uppercase tracking-wider text-slate-600 flex items-center gap-1.5">
+            <span>💳</span> Payment Currency
+          </span>
+          <span className="text-xs font-medium text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-100">
+            Multi-Currency (SGD · USD · CAD)
+          </span>
+        </div>
+        <div className="grid grid-cols-3 gap-2.5">
+          {(['sgd', 'usd', 'cad'] as const).map((curr) => {
+            const cfg = SUPPORTED_CURRENCIES[curr];
+            const isSelected = currency === curr;
+            return (
+              <button
+                key={curr}
+                type="button"
+                onClick={() => {
+                  setCurrency(curr);
+                  setFieldErrors((prev) => {
+                    const next = { ...prev };
+                    delete next.amount;
+                    delete next.cardNumber;
+                    return next;
+                  });
+                }}
+                className={`flex flex-col sm:flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-xl py-2.5 px-3 transition-all ${isSelected
+                  ? 'bg-white text-indigo-700 shadow-md ring-2 ring-indigo-500 font-bold'
+                  : 'bg-white/70 text-slate-600 hover:bg-white hover:text-slate-900 border border-slate-200/80 font-medium'
+                  }`}
+              >
+                <span className="text-lg sm:text-base leading-none">{cfg.flag}</span>
+                <div className="text-center sm:text-left">
+                  <span className="block text-xs sm:text-sm leading-tight">{cfg.code.toUpperCase()}</span>
+                  <span className="text-[10px] text-slate-400 block leading-tight">{cfg.symbol}</span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* High-Value Anti-Fraud Compliance Shield */}
+      {isHighValue && (
+        <div className="mb-6 rounded-xl border border-indigo-200 bg-gradient-to-r from-indigo-50/90 via-blue-50/70 to-slate-50 p-4 text-xs text-indigo-950 shadow-sm">
+          <div className="flex items-start gap-3">
+            <span className="text-xl">🏛️</span>
+            <div className="space-y-1">
+              <span className="font-bold text-indigo-900">
+                High-Value Transaction Anti-Fraud Shield
               </span>
-            )}
+              <p className="text-slate-600 leading-relaxed">
+                In compliance with international card network (Visa / Mastercard / JCB) standards, Customer order identity and Cardholder AVS billing verification are kept strictly separated with Level 2 Invoice metadata and mandatory 3D Secure 2.0. This maximizes approval rates even when paying with a third-party card.
+              </p>
+            </div>
           </div>
         </div>
+      )}
 
-        {/* Currency Selector Pill Control */}
-        <div className="mb-6 rounded-2xl bg-gradient-to-r from-slate-50 via-indigo-50/40 to-slate-50 p-4 border border-slate-200/80 shadow-sm">
-          <div className="flex items-center justify-between mb-2.5">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-600 flex items-center gap-1.5">
-              <span>💳</span> Payment Currency
-            </span>
-            <span className="text-xs font-medium text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-100">
-              Multi-Currency (SGD · USD · CAD)
-            </span>
+      <form onSubmit={handleSubmit} className="space-y-6">
+        {/* ═══════════════════════════════════════════════ */}
+        {/* Step 1: Customer & Order Information            */}
+        {/* ═══════════════════════════════════════════════ */}
+        <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-4 sm:p-5 space-y-4">
+          <div className="flex items-start justify-between gap-3 border-b border-slate-200/70 pb-3">
+            <div className="flex items-center gap-2.5">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-xs font-bold text-white">
+                1
+              </span>
+              <div>
+                <h3 className="text-sm font-bold text-slate-800">
+                  Customer & Order Information
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Who this invoice belongs to (receives the receipt & order confirmation).
+                </p>
+              </div>
+            </div>
           </div>
-          <div className="grid grid-cols-3 gap-2.5">
-            {(['sgd', 'usd', 'cad'] as const).map((curr) => {
-              const cfg = SUPPORTED_CURRENCIES[curr];
-              const isSelected = currency === curr;
-              return (
-                <button
-                  key={curr}
-                  type="button"
-                  onClick={() => {
-                    setCurrency(curr);
+
+          {/* Amount Field */}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label htmlFor="amount" className="block text-sm font-medium text-slate-700">
+                Payment Amount ({currencyConfig.code.toUpperCase()})
+              </label>
+              {currencyReference && (
+                <span className="text-xs font-medium text-slate-400">
+                  {currencyReference.primary}
+                </span>
+              )}
+            </div>
+            <div className="relative">
+              <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-bold text-slate-500">
+                {currencyConfig.symbol}
+              </span>
+              <input
+                id="amount"
+                type="text"
+                inputMode="decimal"
+                value={amount}
+                onChange={(e) => {
+                  setAmount(e.target.value.replace(/[^0-9.]/g, ''));
+                  if (fieldErrors.amount) {
                     setFieldErrors((prev) => {
                       const next = { ...prev };
                       delete next.amount;
-                      delete next.cardNumber;
-                      return next;
-                    });
-                  }}
-                  className={`flex flex-col sm:flex-row items-center justify-center gap-1.5 sm:gap-2 rounded-xl py-2.5 px-3 transition-all ${isSelected
-                      ? 'bg-white text-indigo-700 shadow-md ring-2 ring-indigo-500 font-bold'
-                      : 'bg-white/70 text-slate-600 hover:bg-white hover:text-slate-900 border border-slate-200/80 font-medium'
-                    }`}
-                >
-                  <span className="text-lg sm:text-base leading-none">{cfg.flag}</span>
-                  <div className="text-center sm:text-left">
-                    <span className="block text-xs sm:text-sm leading-tight">{cfg.code.toUpperCase()}</span>
-                    <span className="text-[10px] text-slate-400 block leading-tight">{cfg.symbol}</span>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* High-Value Anti-Fraud Compliance Shield */}
-        {isHighValue && (
-          <div className="mb-6 rounded-xl border border-indigo-200 bg-gradient-to-r from-indigo-50/90 via-blue-50/70 to-slate-50 p-4 text-xs text-indigo-950 shadow-sm">
-            <div className="flex items-start gap-3">
-              <span className="text-xl">🏛️</span>
-              <div className="space-y-1">
-                <span className="font-bold text-indigo-900">
-                  High-Value Transaction Anti-Fraud Shield
-                </span>
-                <p className="text-slate-600 leading-relaxed">
-                  In compliance with international card network (Visa / Mastercard / JCB) standards, Customer order identity and Cardholder AVS billing verification are kept strictly separated with Level 2 Invoice metadata and mandatory 3D Secure 2.0. This maximizes approval rates even when paying with a third-party card.
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        <form onSubmit={handleSubmit} className="space-y-6">
-          {/* ═══════════════════════════════════════════════ */}
-          {/* Step 1: Customer & Order Information            */}
-          {/* ═══════════════════════════════════════════════ */}
-          <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-4 sm:p-5 space-y-4">
-            <div className="flex items-start justify-between gap-3 border-b border-slate-200/70 pb-3">
-              <div className="flex items-center gap-2.5">
-                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-xs font-bold text-white">
-                  1
-                </span>
-                <div>
-                  <h3 className="text-sm font-bold text-slate-800">
-                    Customer & Order Information
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Who this invoice belongs to (receives the receipt & order confirmation).
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {/* Amount Field */}
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <label htmlFor="amount" className="block text-sm font-medium text-slate-700">
-                  Payment Amount ({currencyConfig.code.toUpperCase()})
-                </label>
-                {currencyReference && (
-                  <span className="text-xs font-medium text-slate-400">
-                    {currencyReference.primary}
-                  </span>
-                )}
-              </div>
-              <div className="relative">
-                <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-bold text-slate-500">
-                  {currencyConfig.symbol}
-                </span>
-                <input
-                  id="amount"
-                  type="text"
-                  inputMode="decimal"
-                  value={amount}
-                  onChange={(e) => {
-                    setAmount(e.target.value.replace(/[^0-9.]/g, ''));
-                    if (fieldErrors.amount) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.amount;
-                        return next;
-                      });
-                    }
-                  }}
-                  className={getInputClass('amount') + (currencyConfig.symbol.length > 2 ? ' pl-14' : ' pl-11') + ' font-medium text-base bg-white'}
-                  placeholder="0.00"
-                  disabled={isProcessing}
-                />
-              </div>
-              {fieldErrors.amount ? (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.amount}</p>
-              ) : (
-                <p className="mt-1 text-xs text-slate-400">
-                  Minimum {currencyConfig.symbol}1.00 · Maximum {currencyConfig.symbol}20,000.00 {currencyConfig.code.toUpperCase()}
-                </p>
-              )}
-            </div>
-
-            {/* Customer Name & Customer Email Grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="customer_name" className="mb-1.5 block text-sm font-medium text-slate-700">
-                  Customer Full Name <span className="text-red-500">*</span>
-                </label>
-                <input
-                  id="customer_name"
-                  type="text"
-                  value={customerName}
-                  onChange={(e) => {
-                    setCustomerName(e.target.value);
-                    if (fieldErrors.customerName) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.customerName;
-                        return next;
-                      });
-                    }
-                  }}
-                  className={getInputClass('customerName') + ' bg-white'}
-                  placeholder="e.g. Alex Chen"
-                  autoComplete="name"
-                  maxLength={70}
-                  disabled={isProcessing}
-                />
-                {fieldErrors.customerName ? (
-                  <p className="mt-1 text-xs text-red-500">{fieldErrors.customerName}</p>
-                ) : (
-                  <p className="mt-1 text-xs text-slate-400">Order / invoice recipient name</p>
-                )}
-              </div>
-
-              <div>
-                <label htmlFor="customer_email" className="mb-1.5 block text-sm font-medium text-slate-700">
-                  Customer Email <span className="text-red-500">*</span>
-                </label>
-                <input
-                  id="customer_email"
-                  type="email"
-                  value={customerEmail}
-                  onChange={(e) => {
-                    setCustomerEmail(e.target.value);
-                    if (fieldErrors.customerEmail) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.customerEmail;
-                        return next;
-                      });
-                    }
-                  }}
-                  className={getInputClass('customerEmail') + ' bg-white'}
-                  placeholder="billing@company.com"
-                  autoComplete="email"
-                  disabled={isProcessing}
-                />
-                {fieldErrors.customerEmail ? (
-                  <p className="mt-1 text-xs text-red-500">{fieldErrors.customerEmail}</p>
-                ) : (
-                  <p className="mt-1 text-xs text-slate-400">For invoice receipt & confirmation</p>
-                )}
-              </div>
-            </div>
-
-            {/* Invoice Memo */}
-            <div>
-              <label htmlFor="invoice_desc" className="mb-1.5 block text-sm font-medium text-slate-700">
-                Invoice Memo / Descriptor
-              </label>
-              <input
-                id="invoice_desc"
-                type="text"
-                value={invoiceDescription}
-                onChange={(e) => setInvoiceDescription(e.target.value)}
-                className={getInputClass('invoiceDescription') + ' bg-white'}
-                placeholder="Service description"
-                maxLength={60}
-                disabled={isProcessing}
-              />
-            </div>
-          </div>
-
-          {/* ═══════════════════════════════════════════════ */}
-          {/* Step 2: Payment Method & Cardholder Details     */}
-          {/* ═══════════════════════════════════════════════ */}
-          <div className="rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 space-y-5 shadow-sm">
-            <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
-              <div className="flex items-center gap-2.5">
-                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-900 text-xs font-bold text-white">
-                  2
-                </span>
-                <div>
-                  <h3 className="text-sm font-bold text-slate-800">
-                    Payment Method & Cardholder Details
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Card & billing address can belong to the customer or a third-party cardholder.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {isApplePayAvailable && (
-              <div>
-                <button
-                  type="button"
-                  onClick={handleApplePay}
-                  disabled={isProcessing}
-                  className="w-full flex items-center justify-center gap-2 rounded-xl bg-black px-4 py-3.5 font-bold text-white shadow-md transition-all hover:bg-slate-900 focus:outline-none focus:ring-4 focus:ring-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <svg viewBox="0 0 40 16" width="40" height="16" fill="currentColor">
-                    <path d="M14.93,7.21c0-1.63,1.33-2.61,2.58-3.23c-0.8-1.17-2.06-1.57-2.91-1.6c-1.24-0.12-2.43,0.73-3.06,0.73c-0.64,0-1.62-0.71-2.65-0.69C7.45,2.44,6.13,3.25,5.34,4.61c-1.6,2.78-0.41,6.89,1.15,9.15c0.76,1.11,1.67,2.33,2.87,2.29c1.17-0.04,1.61-0.75,3.02-0.75c1.4,0,1.81,0.75,3.04,0.73c1.24-0.02,2.02-1.11,2.78-2.22c0.88-1.29,1.24-2.54,1.26-2.61C19.41,11.18,14.93,9.45,14.93,7.21 M11.83,1.6C12.48,0.81,12.91,0,12.8-1.02C11.9,1.06,10.66,1.52,9.97,2.32c-0.6,0.7-1.12,1.59-0.97,2.58C10.02,4.98,11.23,4.41,11.83,1.6 M27.86,4.67v8.9h2.3v-8.9H27.86 M24.3,9.12c0-2.31-1.87-4.18-4.18-4.18c-2.31,0-4.18,1.87-4.18,4.18c0,2.31,1.87,4.18,4.18,4.18C22.43,13.3,24.3,11.43,24.3,9.12 M22.25,9.12c0,1.18-0.95,2.13-2.13,2.13c-1.18,0-2.13-0.95-2.13-2.13c0-1.18,0.95-2.13,2.13-2.13C21.3,6.99,22.25,7.94,22.25,9.12 M39.06,8.74c0-0.79-0.64-1.43-1.43-1.43h-2.92v4.86c0,0.79,0.64,1.43,1.43,1.43c0.79,0,1.43-0.64,1.43-1.43V8.74z M36.14,9.37V6.01h1.49v3.36H36.14z M32.65,11.05V2.32h2.05v8.73H32.65" />
-                  </svg>
-                  Pay with Apple Pay
-                </button>
-                <div className="relative mt-5">
-                  <div className="absolute inset-0 flex items-center">
-                    <div className="w-full border-t border-slate-200"></div>
-                  </div>
-                  <div className="relative flex justify-center text-sm">
-                    <span className="bg-white px-3 text-slate-500 font-medium">Or pay with credit / debit card</span>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Third-Party Cardholder Toggle */}
-            <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
-              <label className="flex items-start gap-2.5 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={isThirdPartyCard}
-                  onChange={(e) => {
-                    setIsThirdPartyCard(e.target.checked);
-                    if (fieldErrors.cardholderEmail) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.cardholderEmail;
-                        return next;
-                      });
-                    }
-                  }}
-                  disabled={isProcessing}
-                  className="mt-0.5 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                />
-                <div className="text-xs sm:text-sm">
-                  <span className="font-semibold text-slate-800">
-                    Paying with someone else&apos;s credit card
-                  </span>
-                  <span className="block text-xs text-slate-500 mt-0.5">
-                    Check this if the cardholder is different from the customer above.
-                  </span>
-                </div>
-              </label>
-
-              {isThirdPartyCard ? (
-                <div className="mt-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                  <strong>Third-party card mode:</strong> This card will be processed as a one-time payment and will not be bound to the customer&apos;s profile. Enter the cardholder&apos;s own name and card billing address below.
-                </div>
-              ) : customerName.trim() &&
-                cardholderName.trim() &&
-                customerName.trim().toLowerCase() !== cardholderName.trim().toLowerCase() ? (
-                <div className="mt-2.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
-                  Cardholder name differs from customer name — this transaction will automatically be processed as a one-time third-party card payment.
-                </div>
-              ) : null}
-            </div>
-
-            {/* Cardholder Name */}
-            <div>
-              <div className="mb-1.5 flex items-center justify-between gap-2">
-                <label htmlFor="cardholder_name" className="block text-sm font-medium text-slate-700">
-                  Cardholder Name <span className="text-red-500">*</span>
-                </label>
-                {!isThirdPartyCard &&
-                  customerName.trim().length >= 2 &&
-                  cardholderName.trim() !== customerName.trim() && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setCardholderName(customerName.trim());
-                        if (fieldErrors.cardholderName) {
-                          setFieldErrors((prev) => {
-                            const next = { ...prev };
-                            delete next.cardholderName;
-                            return next;
-                          });
-                        }
-                      }}
-                      disabled={isProcessing}
-                      className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
-                    >
-                      Same as customer
-                    </button>
-                  )}
-              </div>
-              <input
-                id="cardholder_name"
-                type="text"
-                value={cardholderName}
-                onChange={(e) => {
-                  setCardholderName(e.target.value);
-                  if (fieldErrors.cardholderName) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.cardholderName;
                       return next;
                     });
                   }
                 }}
-                className={getInputClass('cardholderName')}
-                placeholder="Full name as printed on card"
-                autoComplete="cc-name"
+                className={getInputClass('amount') + (currencyConfig.symbol.length > 2 ? ' pl-14' : ' pl-11') + ' font-medium text-base bg-white'}
+                placeholder="0.00"
+                disabled={isProcessing}
+              />
+            </div>
+            {fieldErrors.amount ? (
+              <p className="mt-1 text-xs text-red-500">{fieldErrors.amount}</p>
+            ) : (
+              <p className="mt-1 text-xs text-slate-400">
+                Minimum {currencyConfig.symbol}1.00 · Maximum {currencyConfig.symbol}20,000.00 {currencyConfig.code.toUpperCase()}
+              </p>
+            )}
+          </div>
+
+          {/* Customer Name & Customer Email Grid */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="customer_name" className="mb-1.5 block text-sm font-medium text-slate-700">
+                Customer Full Name <span className="text-red-500">*</span>
+              </label>
+              <input
+                id="customer_name"
+                type="text"
+                value={customerName}
+                onChange={(e) => {
+                  setCustomerName(e.target.value);
+                  if (fieldErrors.customerName) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.customerName;
+                      return next;
+                    });
+                  }
+                }}
+                className={getInputClass('customerName') + ' bg-white'}
+                placeholder="e.g. Alex Chen"
+                autoComplete="name"
                 maxLength={70}
                 disabled={isProcessing}
               />
-              {fieldErrors.cardholderName && (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderName}</p>
-              )}
-            </div>
-
-            {/* Cardholder Email (Optional when paying with third-party card) */}
-            {isThirdPartyCard && (
-              <div>
-                <label htmlFor="cardholder_email" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
-                  <span>Cardholder Email</span>
-                  <span className="text-xs font-normal text-slate-400">Optional</span>
-                </label>
-                <input
-                  id="cardholder_email"
-                  type="email"
-                  value={cardholderEmail}
-                  onChange={(e) => {
-                    setCardholderEmail(e.target.value);
-                    if (fieldErrors.cardholderEmail) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.cardholderEmail;
-                        return next;
-                      });
-                    }
-                  }}
-                  className={getInputClass('cardholderEmail')}
-                  placeholder="cardholder@example.com"
-                  disabled={isProcessing}
-                />
-                {fieldErrors.cardholderEmail ? (
-                  <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderEmail}</p>
-                ) : (
-                  <p className="mt-1 text-xs text-slate-400">Optional payer reference (invoice receipt still goes to customer email)</p>
-                )}
-              </div>
-            )}
-
-            {/* Card Number */}
-            <div>
-              <label htmlFor="card" className="mb-1.5 block text-sm font-medium text-slate-700">
-                Card Number <span className="text-red-500">*</span>
-              </label>
-              <div className="relative">
-                <input
-                  id="card"
-                  type="text"
-                  inputMode="numeric"
-                  value={cardNumber}
-                  onChange={(e) => {
-                    setCardNumber(formatCardNumber(e.target.value));
-                    if (fieldErrors.cardNumber) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.cardNumber;
-                        return next;
-                      });
-                    }
-                  }}
-                  className={getInputClass('cardNumber') + ' tracking-wider pr-24'}
-                  placeholder="•••• •••• •••• ••••"
-                  autoComplete="cc-number"
-                  maxLength={23}
-                  disabled={isProcessing}
-                />
-                <CardBrandIcon brand={cardBrand} />
-              </div>
-              {fieldErrors.cardNumber ? (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.cardNumber}</p>
+              {fieldErrors.customerName ? (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.customerName}</p>
               ) : (
-                <p className="mt-1 text-xs text-slate-400">
-                  Accepted for {currencyConfig.code.toUpperCase()}: {currencyConfig.supportedBrandsLabel}
-                </p>
+                <p className="mt-1 text-xs text-slate-400">Order / invoice recipient name</p>
               )}
             </div>
 
-            {/* Expiry & CVC */}
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="expiry" className="mb-1.5 block text-sm font-medium text-slate-700">
-                  Expiration <span className="text-red-500">*</span>
-                </label>
-                <input
-                  id="expiry"
-                  type="text"
-                  inputMode="numeric"
-                  value={expiry}
-                  onChange={(e) => {
-                    setExpiry(formatExpiry(e.target.value));
-                    if (fieldErrors.expiry) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.expiry;
-                        return next;
-                      });
-                    }
-                  }}
-                  className={getInputClass('expiry')}
-                  placeholder="MM/YY"
-                  autoComplete="cc-exp"
-                  maxLength={5}
-                  disabled={isProcessing}
-                />
-                {fieldErrors.expiry && (
-                  <p className="mt-1 text-xs text-red-500">{fieldErrors.expiry}</p>
-                )}
-              </div>
+            <div>
+              <label htmlFor="customer_email" className="mb-1.5 block text-sm font-medium text-slate-700">
+                Customer Email <span className="text-red-500">*</span>
+              </label>
+              <input
+                id="customer_email"
+                type="email"
+                value={customerEmail}
+                onChange={(e) => {
+                  setCustomerEmail(e.target.value);
+                  if (fieldErrors.customerEmail) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.customerEmail;
+                      return next;
+                    });
+                  }
+                }}
+                className={getInputClass('customerEmail') + ' bg-white'}
+                placeholder="billing@company.com"
+                autoComplete="email"
+                disabled={isProcessing}
+              />
+              {fieldErrors.customerEmail ? (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.customerEmail}</p>
+              ) : (
+                <p className="mt-1 text-xs text-slate-400">For invoice receipt & confirmation</p>
+              )}
+            </div>
+          </div>
 
+          {/* Invoice Memo */}
+          <div>
+            <label htmlFor="invoice_desc" className="mb-1.5 block text-sm font-medium text-slate-700">
+              Invoice Memo / Descriptor
+            </label>
+            <input
+              id="invoice_desc"
+              type="text"
+              value={invoiceDescription}
+              onChange={(e) => setInvoiceDescription(e.target.value)}
+              className={getInputClass('invoiceDescription') + ' bg-white'}
+              placeholder="Service description"
+              maxLength={60}
+              disabled={isProcessing}
+            />
+          </div>
+        </div>
+
+        {/* ═══════════════════════════════════════════════ */}
+        {/* Step 2: Payment Method & Cardholder Details     */}
+        {/* ═══════════════════════════════════════════════ */}
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 space-y-5 shadow-sm">
+          <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+            <div className="flex items-center gap-2.5">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-900 text-xs font-bold text-white">
+                2
+              </span>
               <div>
-                <label htmlFor="cvc" className="mb-1.5 block text-sm font-medium text-slate-700">
-                  Security Code ({cardBrand === 'amex' ? '4 Digits' : 'CVC / CVV'}) <span className="text-red-500">*</span>
-                </label>
-                <input
-                  id="cvc"
-                  type="password"
-                  inputMode="numeric"
-                  value={cvc}
-                  onChange={(e) => {
-                    setCvc(e.target.value.replace(/\D/g, '').slice(0, maxCvcLength));
-                    if (fieldErrors.cvc) {
-                      setFieldErrors((prev) => {
-                        const next = { ...prev };
-                        delete next.cvc;
-                        return next;
-                      });
-                    }
-                  }}
-                  className={getInputClass('cvc')}
-                  placeholder={cardBrand === 'amex' ? '••••' : '•••'}
-                  autoComplete="cc-csc"
-                  maxLength={maxCvcLength}
-                  disabled={isProcessing}
-                />
-                {fieldErrors.cvc && (
-                  <p className="mt-1 text-xs text-red-500">{fieldErrors.cvc}</p>
-                )}
+                <h3 className="text-sm font-bold text-slate-800">
+                  Payment Method & Cardholder Details
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Card & billing address can belong to the customer or a third-party cardholder.
+                </p>
               </div>
             </div>
+          </div>
 
-            {/* Cardholder Billing Address (AVS Standard) */}
-            <div className="space-y-4 pt-2 border-t border-slate-100">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                  Cardholder Billing Address (AVS)
-                </span>
-                <div className="h-px flex-1 bg-slate-100" />
+          {isApplePayAvailable && (
+            <div>
+              <button
+                type="button"
+                onClick={handleApplePay}
+                disabled={isProcessing}
+                className="w-full flex items-center justify-center gap-2 rounded-xl bg-black px-4 py-3.5 font-bold text-white shadow-md transition-all hover:bg-slate-900 focus:outline-none focus:ring-4 focus:ring-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <svg viewBox="0 0 40 16" width="40" height="16" fill="currentColor">
+                  <path d="M14.93,7.21c0-1.63,1.33-2.61,2.58-3.23c-0.8-1.17-2.06-1.57-2.91-1.6c-1.24-0.12-2.43,0.73-3.06,0.73c-0.64,0-1.62-0.71-2.65-0.69C7.45,2.44,6.13,3.25,5.34,4.61c-1.6,2.78-0.41,6.89,1.15,9.15c0.76,1.11,1.67,2.33,2.87,2.29c1.17-0.04,1.61-0.75,3.02-0.75c1.4,0,1.81,0.75,3.04,0.73c1.24-0.02,2.02-1.11,2.78-2.22c0.88-1.29,1.24-2.54,1.26-2.61C19.41,11.18,14.93,9.45,14.93,7.21 M11.83,1.6C12.48,0.81,12.91,0,12.8-1.02C11.9,1.06,10.66,1.52,9.97,2.32c-0.6,0.7-1.12,1.59-0.97,2.58C10.02,4.98,11.23,4.41,11.83,1.6 M27.86,4.67v8.9h2.3v-8.9H27.86 M24.3,9.12c0-2.31-1.87-4.18-4.18-4.18c-2.31,0-4.18,1.87-4.18,4.18c0,2.31,1.87,4.18,4.18,4.18C22.43,13.3,24.3,11.43,24.3,9.12 M22.25,9.12c0,1.18-0.95,2.13-2.13,2.13c-1.18,0-2.13-0.95-2.13-2.13c0-1.18,0.95-2.13,2.13-2.13C21.3,6.99,22.25,7.94,22.25,9.12 M39.06,8.74c0-0.79-0.64-1.43-1.43-1.43h-2.92v4.86c0,0.79,0.64,1.43,1.43,1.43c0.79,0,1.43-0.64,1.43-1.43V8.74z M36.14,9.37V6.01h1.49v3.36H36.14z M32.65,11.05V2.32h2.05v8.73H32.65" />
+                </svg>
+                Pay with Apple Pay
+              </button>
+              <div className="relative mt-5">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-slate-200"></div>
+                </div>
+                <div className="relative flex justify-center text-sm">
+                  <span className="bg-white px-3 text-slate-500 font-medium">Or pay with credit / debit card</span>
+                </div>
               </div>
+            </div>
+          )}
 
-              {/* AVS Notification Banner */}
-              {countryConfig.isAvsStrict ? (
-                <div className="rounded-xl border border-indigo-100 bg-indigo-50/70 p-3 text-xs text-indigo-900">
-                  <div className="flex items-start gap-2">
-                    <span className="text-sm">🛡️</span>
-                    <div>
-                      <span className="font-semibold">Cardholder AVS Verification Required:</span>
-                      <p className="mt-0.5 text-indigo-700">
-                        Enter the billing address registered on the <strong>cardholder&apos;s</strong> {countryConfig.name} credit card statement (not the customer&apos;s address if paying with someone else&apos;s card).
-                      </p>
-                    </div>
+          {/* Third-Party Cardholder Toggle */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
+            <label className="flex items-start gap-2.5 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={isThirdPartyCard}
+                onChange={(e) => {
+                  setIsThirdPartyCard(e.target.checked);
+                  if (fieldErrors.cardholderEmail) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.cardholderEmail;
+                      return next;
+                    });
+                  }
+                }}
+                disabled={isProcessing}
+                className="mt-0.5 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+              />
+              <div className="text-xs sm:text-sm">
+                <span className="font-semibold text-slate-800">
+                  Paying with someone else&apos;s credit card
+                </span>
+                <span className="block text-xs text-slate-500 mt-0.5">
+                  Check this if the cardholder is different from the customer above.
+                </span>
+              </div>
+            </label>
+
+            {isThirdPartyCard ? (
+              <div className="mt-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                <strong>Third-party card mode:</strong> This card will be processed as a one-time payment and will not be bound to the customer&apos;s profile. Enter the cardholder&apos;s own name and card billing address below.
+              </div>
+            ) : customerName.trim() &&
+              cardholderName.trim() &&
+              customerName.trim().toLowerCase() !== cardholderName.trim().toLowerCase() ? (
+              <div className="mt-2.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
+                Cardholder name differs from customer name — this transaction will automatically be processed as a one-time third-party card payment.
+              </div>
+            ) : null}
+          </div>
+
+          {/* Cardholder Name */}
+          <div>
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <label htmlFor="cardholder_name" className="block text-sm font-medium text-slate-700">
+                Cardholder Name <span className="text-red-500">*</span>
+              </label>
+              {!isThirdPartyCard &&
+                customerName.trim().length >= 2 &&
+                cardholderName.trim() !== customerName.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCardholderName(customerName.trim());
+                      if (fieldErrors.cardholderName) {
+                        setFieldErrors((prev) => {
+                          const next = { ...prev };
+                          delete next.cardholderName;
+                          return next;
+                        });
+                      }
+                    }}
+                    disabled={isProcessing}
+                    className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
+                  >
+                    Same as customer
+                  </button>
+                )}
+            </div>
+            <input
+              id="cardholder_name"
+              type="text"
+              value={cardholderName}
+              onChange={(e) => {
+                setCardholderName(e.target.value);
+                if (fieldErrors.cardholderName) {
+                  setFieldErrors((prev) => {
+                    const next = { ...prev };
+                    delete next.cardholderName;
+                    return next;
+                  });
+                }
+              }}
+              className={getInputClass('cardholderName')}
+              placeholder="Full name as printed on card"
+              autoComplete="cc-name"
+              maxLength={70}
+              disabled={isProcessing}
+            />
+            {fieldErrors.cardholderName && (
+              <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderName}</p>
+            )}
+          </div>
+
+          {/* Cardholder Email (Optional when paying with third-party card) */}
+          {isThirdPartyCard && (
+            {/* Cardholder Email (shown when paying with third-party card or cardholder name differs) */ }
+            {showCardholderEmailField && (
+            <div>
+              <label htmlFor="cardholder_email" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
+                <span>Cardholder Email</span>
+                <span className="text-xs font-normal text-slate-400">Optional</span>
+                <span className="text-xs font-normal text-slate-400">Optional · 3DS 2.0</span>
+              </label>
+              <input
+                id="cardholder_email"
+                type="email"
+                value={cardholderEmail}
+                onChange={(e) => {
+                  setCardholderEmail(e.target.value);
+                  if (fieldErrors.cardholderEmail) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.cardholderEmail;
+                      return next;
+                    });
+                  }
+                }}
+                className={getInputClass('cardholderEmail')}
+                placeholder="cardholder@example.com"
+                disabled={isProcessing}
+              />
+              {fieldErrors.cardholderEmail ? (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderEmail}</p>
+              ) : (
+                  <p className="mt-1 text-xs text-slate-400">Optional payer reference (invoice receipt still goes to customer email)</p>
+                  <p className="mt-1 text-xs text-slate-400">
+                    Used for 3DS 2.0 cardholder verification (invoice receipt still goes to customer email)
+                  </p>
+              )}
+            </div>
+          )}
+
+          {/* Cardholder Mobile Phone (Optional · EMV 3DS 2.0 Risk Scoring / SMS OTP) */}
+          <div>
+            <label htmlFor="cardholder_phone" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
+              <span>Cardholder Mobile Phone</span>
+              <span className="text-xs font-normal text-slate-400">Optional · 3DS 2.0</span>
+            </label>
+            <input
+              id="cardholder_phone"
+              type="tel"
+              value={cardholderPhone}
+              onChange={(e) => {
+                setCardholderPhone(e.target.value);
+                if (fieldErrors.cardholderPhone) {
+                  setFieldErrors((prev) => {
+                    const next = { ...prev };
+                    delete next.cardholderPhone;
+                    return next;
+                  });
+                }
+              }}
+              className={getInputClass('cardholderPhone')}
+              placeholder={`${getCountryDialCode(country)} 8123 4567`}
+              autoComplete="tel"
+              maxLength={24}
+              disabled={isProcessing}
+            />
+            {fieldErrors.cardholderPhone ? (
+              <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderPhone}</p>
+            ) : (
+              <p className="mt-1 text-xs text-slate-400">
+                Optional · International format with country code (recommended for EMV 3DS 2.0 risk scoring &amp; bank OTP)
+              </p>
+            )}
+          </div>
+
+          {/* Card Number */}
+          <div>
+            <label htmlFor="card" className="mb-1.5 block text-sm font-medium text-slate-700">
+              Card Number <span className="text-red-500">*</span>
+            </label>
+            <div className="relative">
+              <input
+                id="card"
+                type="text"
+                inputMode="numeric"
+                value={cardNumber}
+                onChange={(e) => {
+                  setCardNumber(formatCardNumber(e.target.value));
+                  if (fieldErrors.cardNumber) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.cardNumber;
+                      return next;
+                    });
+                  }
+                }}
+                className={getInputClass('cardNumber') + ' tracking-wider pr-24'}
+                placeholder="•••• •••• •••• ••••"
+                autoComplete="cc-number"
+                maxLength={23}
+                disabled={isProcessing}
+              />
+              <CardBrandIcon brand={cardBrand} />
+            </div>
+            {fieldErrors.cardNumber ? (
+              <p className="mt-1 text-xs text-red-500">{fieldErrors.cardNumber}</p>
+            ) : (
+              <p className="mt-1 text-xs text-slate-400">
+                Accepted for {currencyConfig.code.toUpperCase()}: {currencyConfig.supportedBrandsLabel}
+              </p>
+            )}
+          </div>
+
+          {/* Expiry & CVC */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="expiry" className="mb-1.5 block text-sm font-medium text-slate-700">
+                Expiration <span className="text-red-500">*</span>
+              </label>
+              <input
+                id="expiry"
+                type="text"
+                inputMode="numeric"
+                value={expiry}
+                onChange={(e) => {
+                  setExpiry(formatExpiry(e.target.value));
+                  if (fieldErrors.expiry) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.expiry;
+                      return next;
+                    });
+                  }
+                }}
+                className={getInputClass('expiry')}
+                placeholder="MM/YY"
+                autoComplete="cc-exp"
+                maxLength={5}
+                disabled={isProcessing}
+              />
+              {fieldErrors.expiry && (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.expiry}</p>
+              )}
+            </div>
+
+            <div>
+              <label htmlFor="cvc" className="mb-1.5 block text-sm font-medium text-slate-700">
+                Security Code ({cardBrand === 'amex' ? '4 Digits' : 'CVC / CVV'}) <span className="text-red-500">*</span>
+              </label>
+              <input
+                id="cvc"
+                type="password"
+                inputMode="numeric"
+                value={cvc}
+                onChange={(e) => {
+                  setCvc(e.target.value.replace(/\D/g, '').slice(0, maxCvcLength));
+                  if (fieldErrors.cvc) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.cvc;
+                      return next;
+                    });
+                  }
+                }}
+                className={getInputClass('cvc')}
+                placeholder={cardBrand === 'amex' ? '••••' : '•••'}
+                autoComplete="cc-csc"
+                maxLength={maxCvcLength}
+                disabled={isProcessing}
+              />
+              {fieldErrors.cvc && (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.cvc}</p>
+              )}
+            </div>
+          </div>
+
+          {/* Cardholder Billing Address (AVS Standard) */}
+          <div className="space-y-4 pt-2 border-t border-slate-100">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Cardholder Billing Address (AVS)
+              </span>
+              <div className="h-px flex-1 bg-slate-100" />
+            </div>
+
+            {/* AVS Notification Banner */}
+            {countryConfig.isAvsStrict ? (
+              <div className="rounded-xl border border-indigo-100 bg-indigo-50/70 p-3 text-xs text-indigo-900">
+                <div className="flex items-start gap-2">
+                  <span className="text-sm">🛡️</span>
+                  <div>
+                    <span className="font-semibold">Cardholder AVS Verification Required:</span>
+                    <p className="mt-0.5 text-indigo-700">
+                      Enter the billing address registered on the <strong>cardholder&apos;s</strong> {countryConfig.name} credit card statement (not the customer&apos;s address if paying with someone else&apos;s card).
+                    </p>
                   </div>
                 </div>
-              ) : (
-                <div className="rounded-xl border border-slate-100 bg-slate-50 p-2.5 text-xs text-slate-600">
-                  <span>
-                    🌍 Cardholder Billing Address: Enter the billing address registered with this credit card.
-                  </span>
-                </div>
-              )}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-slate-100 bg-slate-50 p-2.5 text-xs text-slate-600">
+                <span>
+                  🌍 Cardholder Billing Address: Enter the billing address registered with this credit card.
+                </span>
+              </div>
+            )}
 
             {/* Country Selection */}
             <div>
@@ -2031,78 +2168,78 @@ export const PaymentForm = () => {
                 )}
               </div>
             </div>
-            </div>
           </div>
+        </div>
 
-          {/* Top Error Message Banner */}
-          {error && (
-            <div className="flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50 p-3.5 text-sm text-red-700">
-              <svg className="mt-0.5 h-4 w-4 shrink-0 text-red-500" fill="currentColor" viewBox="0 0 20 20">
+        {/* Top Error Message Banner */}
+        {error && (
+          <div className="flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50 p-3.5 text-sm text-red-700">
+            <svg className="mt-0.5 h-4 w-4 shrink-0 text-red-500" fill="currentColor" viewBox="0 0 20 20">
+              <path
+                fillRule="evenodd"
+                d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
+                clipRule="evenodd"
+              />
+            </svg>
+            <span className="font-medium">{error}</span>
+          </div>
+        )}
+
+        {/* Submit Button */}
+        <button
+          type="submit"
+          disabled={isProcessing || !omiseLoaded}
+          className="relative w-full overflow-hidden rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 px-6 py-3.5 text-sm font-semibold text-white shadow-lg shadow-indigo-200 transition-all hover:from-indigo-700 hover:to-purple-700 hover:shadow-xl active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {isProcessing ? (
+            <span className="flex items-center justify-center gap-2">
+              <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24">
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                  fill="none"
+                />
                 <path
-                  fillRule="evenodd"
-                  d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
-                  clipRule="evenodd"
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
                 />
               </svg>
-              <span className="font-medium">{error}</span>
-            </div>
+              {status === 'tokenizing'
+                ? 'Verifying Customer & Securing Card…'
+                : 'Authorizing Transaction with Bank…'}
+            </span>
+          ) : (
+            `Authorize Payment of ${currencyConfig.symbol}${parseFloat(amount || '0').toFixed(2)} ${currencyConfig.code.toUpperCase()}`
           )}
+        </button>
 
-          {/* Submit Button */}
-          <button
-            type="submit"
-            disabled={isProcessing || !omiseLoaded}
-            className="relative w-full overflow-hidden rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 px-6 py-3.5 text-sm font-semibold text-white shadow-lg shadow-indigo-200 transition-all hover:from-indigo-700 hover:to-purple-700 hover:shadow-xl active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {isProcessing ? (
-              <span className="flex items-center justify-center gap-2">
-                <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24">
-                  <circle
-                    className="opacity-25"
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="currentColor"
-                    strokeWidth="4"
-                    fill="none"
-                  />
-                  <path
-                    className="opacity-75"
-                    fill="currentColor"
-                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                  />
-                </svg>
-                {status === 'tokenizing'
-                  ? 'Verifying Customer & Securing Card…'
-                  : 'Authorizing Transaction with Bank…'}
-              </span>
-            ) : (
-              `Authorize Payment of ${currencyConfig.symbol}${parseFloat(amount || '0').toFixed(2)} ${currencyConfig.code.toUpperCase()}`
-            )}
-          </button>
-
-          {/* Compliance & Security Badges */}
-          <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-center text-xs text-slate-400">
-            <span className="inline-flex items-center gap-1 font-medium text-slate-600">
-              <svg className="h-3.5 w-3.5 text-emerald-500" fill="currentColor" viewBox="0 0 20 20">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-              </svg>
-              Separated Customer & Cardholder
-            </span>
-            <span>·</span>
-            <span className="inline-flex items-center gap-1">
-              <svg className="h-3.5 w-3.5 text-indigo-500" fill="currentColor" viewBox="0 0 20 20">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-              </svg>
-              Strict AVS Verification
-            </span>
-            <span>·</span>
-            <span>3D Secure 2.0</span>
-            <span>·</span>
-            <span>Level 2 Invoicing Data</span>
-          </div>
-        </form>
-      </div>
+        {/* Compliance & Security Badges */}
+        <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-center text-xs text-slate-400">
+          <span className="inline-flex items-center gap-1 font-medium text-slate-600">
+            <svg className="h-3.5 w-3.5 text-emerald-500" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+            </svg>
+            Separated Customer & Cardholder
+          </span>
+          <span>·</span>
+          <span className="inline-flex items-center gap-1">
+            <svg className="h-3.5 w-3.5 text-indigo-500" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+            </svg>
+            Strict AVS Verification
+          </span>
+          <span>·</span>
+          <span>3D Secure 2.0</span>
+          <span>·</span>
+          <span>Level 2 Invoicing Data</span>
+        </div>
+      </form>
     </div>
-  );
+  </div>
+);
 };

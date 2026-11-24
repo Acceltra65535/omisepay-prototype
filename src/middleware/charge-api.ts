@@ -190,6 +190,200 @@ function verifyOmiseSignature(
   return false;
 }
 
+const THREE_DS_REJECTED_MESSAGE =
+  '3D Secure 2.0 authentication is mandatory for all card payments. This card did not complete 3DS verification, so the authorization hold has been automatically reversed.';
+
+interface FinalizeChargeResult {
+  chargeData: any;
+  rejectedBy3DSGuard: boolean;
+  failureCode?: string | undefined;
+  failureMessage?: string | undefined;
+}
+
+// Per-charge in-process lock to avoid duplicate capture/reverse calls when webhook and 3DS return race
+const inFlightFinalizations = new Map<string, Promise<FinalizeChargeResult>>();
+
+function getChargeAuthenticatedBy(chargeData: any): string | null {
+  const raw = chargeData?.authenticated_by;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+}
+
+function isCharge3DSAuthenticated(chargeData: any): boolean {
+  const auth = (getChargeAuthenticatedBy(chargeData) || '').toUpperCase();
+  return auth === '3DS' || auth === 'PASSKEY';
+}
+
+/**
+ * Enforce mandatory 3DS on manual-capture (capture: false) card charges:
+ * - Apple Pay is processed via native device biometric/cryptogram (non-3DS) and exempted here.
+ * - Card charges that return authorized === true & !paid:
+ *   * If authenticated_by is '3DS' or 'PASSKEY': POST /charges/:id/capture to settle.
+ *   * Otherwise (non-3DS authorized): POST /charges/:id/reverse and reject transaction.
+ */
+async function enforce3DSAndFinalizeCharge(
+  chargeData: any,
+  secretKey: string,
+  opts?: {
+    isApplePay?: boolean | undefined;
+    cachedEntry?: StoredChargeEntry | undefined;
+  },
+): Promise<FinalizeChargeResult> {
+  if (!chargeData?.id || !isSecretKeyReady(secretKey)) {
+    return { chargeData, rejectedBy3DSGuard: false };
+  }
+
+  const isApplePay = Boolean(
+    opts?.isApplePay ||
+    chargeData?.metadata?.payment_method === 'apple_pay' ||
+    opts?.cachedEntry?.paymentMethod === 'apple_pay',
+  );
+
+  if (
+    !OMISE_CONFIG.threeDS.required ||
+    !OMISE_CONFIG.threeDS.enforceManualCaptureGuard ||
+    isApplePay
+  ) {
+    return { chargeData, rejectedBy3DSGuard: false };
+  }
+
+  // If this charge was already reversed by our 3DS guard, preserve the rejection across subsequent polls
+  if (
+    opts?.cachedEntry?.failureCode === 'three_ds_authentication_required' &&
+    (chargeData.reversed === true ||
+      chargeData.status === 'reversed' ||
+      chargeData.status === 'failed')
+  ) {
+    return {
+      chargeData,
+      rejectedBy3DSGuard: true,
+      failureCode: 'three_ds_authentication_required',
+      failureMessage: opts.cachedEntry.failureMessage || THREE_DS_REJECTED_MESSAGE,
+    };
+  }
+
+  if (
+    chargeData.paid === true ||
+    chargeData.status === 'failed' ||
+    chargeData.status === 'expired' ||
+    chargeData.status === 'reversed' ||
+    chargeData.reversed === true ||
+    chargeData.authorized !== true
+  ) {
+    return { chargeData, rejectedBy3DSGuard: false };
+  }
+
+  const chargeId = String(chargeData.id);
+  const existingTask = inFlightFinalizations.get(chargeId);
+  if (existingTask) {
+    return existingTask;
+  }
+
+  const task = (async (): Promise<FinalizeChargeResult> => {
+    // 1. Authenticated via 3DS / PASSKEY -> capture funds if still capturable
+    if (isCharge3DSAuthenticated(chargeData)) {
+      if (chargeData.capturable === false) {
+        return { chargeData, rejectedBy3DSGuard: false };
+      }
+      try {
+        const captureRes = await fetch(
+          `https://api.omise.co/charges/${encodeURIComponent(chargeId)}/capture`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: getAuthHeader(secretKey),
+            },
+          },
+        );
+        const capturedData = await captureRes.json();
+        if (captureRes.ok && capturedData?.object === 'charge') {
+          return { chargeData: capturedData, rejectedBy3DSGuard: false };
+        }
+
+        // Handle race condition if another process/webhook captured it concurrently
+        const refetchRes = await fetch(
+          `https://api.omise.co/charges/${encodeURIComponent(chargeId)}`,
+          {
+            method: 'GET',
+            headers: { Authorization: getAuthHeader(secretKey) },
+          },
+        );
+        if (refetchRes.ok) {
+          const refetched = await refetchRes.json();
+          if (refetched?.object === 'charge' && refetched.paid === true) {
+            return { chargeData: refetched, rejectedBy3DSGuard: false };
+          }
+        }
+
+        console.error('3DS verified charge capture failed:', {
+          chargeId,
+          status: captureRes.status,
+          code: capturedData?.code,
+          message: capturedData?.message,
+        });
+      } catch (captureErr) {
+        console.error('3DS verified charge capture network error:', captureErr);
+      }
+      return { chargeData, rejectedBy3DSGuard: false };
+    }
+
+    // 2. Authorized WITHOUT 3DS -> automatically reverse the hold and reject
+    let finalData = chargeData;
+    try {
+      const reverseRes = await fetch(
+        `https://api.omise.co/charges/${encodeURIComponent(chargeId)}/reverse`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: getAuthHeader(secretKey),
+          },
+        },
+      );
+      const reversedData = await reverseRes.json();
+      if (reverseRes.ok && reversedData?.object === 'charge') {
+        finalData = reversedData;
+      } else {
+        const refetchRes = await fetch(
+          `https://api.omise.co/charges/${encodeURIComponent(chargeId)}`,
+          {
+            method: 'GET',
+            headers: { Authorization: getAuthHeader(secretKey) },
+          },
+        );
+        if (refetchRes.ok) {
+          const refetched = await refetchRes.json();
+          if (refetched?.object === 'charge') {
+            finalData = refetched;
+          }
+        }
+        console.warn('3DS guard reverse response:', {
+          chargeId,
+          status: reverseRes.status,
+          code: reversedData?.code,
+          message: reversedData?.message,
+        });
+      }
+    } catch (reverseErr) {
+      console.error('3DS guard reverse network error:', reverseErr);
+    }
+
+    return {
+      chargeData: finalData,
+      rejectedBy3DSGuard: true,
+      failureCode: 'three_ds_authentication_required',
+      failureMessage: THREE_DS_REJECTED_MESSAGE,
+    };
+  })();
+
+  inFlightFinalizations.set(chargeId, task);
+  try {
+    return await task;
+  } finally {
+    inFlightFinalizations.delete(chargeId);
+  }
+}
+
 /**
  * Build a uniform client-facing charge response object.
  */
@@ -205,6 +399,12 @@ function formatChargeResponse(
     cardholderName?: string | undefined;
     cardholderEmail?: string | undefined;
     isThirdPartyCard?: boolean | undefined;
+    paymentMethod?: string | undefined;
+    authenticatedBy?: string | null | undefined;
+    reversed?: boolean | undefined;
+    forcedStatus?: string | undefined;
+    forcedFailureCode?: string | null | undefined;
+    forcedFailureMessage?: string | null | undefined;
     includeAuthRedirect?: boolean | undefined;
   },
 ) {
@@ -232,16 +432,33 @@ function formatChargeResponse(
       ? opts.isThirdPartyCard
       : metaThirdParty === true || metaThirdParty === 'true';
 
+  const resolvedAuthenticatedBy =
+    getChargeAuthenticatedBy(chargeData) ?? opts?.authenticatedBy ?? null;
+  const resolvedPaymentMethod =
+    opts?.paymentMethod ||
+    (typeof chargeData?.metadata?.payment_method === 'string' &&
+      chargeData.metadata.payment_method
+      ? chargeData.metadata.payment_method
+      : 'card');
+
   const base: Record<string, any> = {
     id: chargeData.id,
     amount: chargeData.amount,
     currency: chargeData.currency,
-    status: chargeData.status,
+    status: opts?.forcedStatus || chargeData.status,
     authorized: chargeData.authorized,
     paid: chargeData.paid,
-    authenticated_by: chargeData.authenticated_by || chargeData.authorization_type || null,
-    failure_code: chargeData.failure_code || null,
-    failure_message: chargeData.failure_message || null,
+    reversed:
+      typeof opts?.reversed === 'boolean'
+        ? opts.reversed
+        : Boolean(chargeData.reversed),
+    authenticated_by: resolvedAuthenticatedBy,
+    three_ds_verified: isCharge3DSAuthenticated({
+      authenticated_by: resolvedAuthenticatedBy,
+    }),
+    payment_method: resolvedPaymentMethod,
+    failure_code: opts?.forcedFailureCode ?? chargeData.failure_code ?? null,
+    failure_message: opts?.forcedFailureMessage ?? chargeData.failure_message ?? null,
     customer_id:
       opts?.customerId ||
       chargeData.customer ||
@@ -254,23 +471,23 @@ function formatChargeResponse(
     invoice_description: opts?.invoiceDescription || chargeData.description || null,
     customer: (email || name)
       ? {
-          email: email || null,
-          name: name || null,
-        }
+        email: email || null,
+        name: name || null,
+      }
       : null,
     payer: (resolvedCardholderName || resolvedCardholderEmail || resolvedIsThirdParty)
       ? {
-          cardholder_name: resolvedCardholderName,
-          cardholder_email: resolvedCardholderEmail,
-          is_third_party_card: resolvedIsThirdParty,
-        }
+        cardholder_name: resolvedCardholderName,
+        cardholder_email: resolvedCardholderEmail,
+        is_third_party_card: resolvedIsThirdParty,
+      }
       : null,
     card: chargeData.card
       ? {
-          last_digits: chargeData.card.last_digits,
-          brand: chargeData.card.brand,
-          name: chargeData.card.name,
-        }
+        last_digits: chargeData.card.last_digits,
+        brand: chargeData.card.brand,
+        name: chargeData.card.name,
+      }
       : null,
     created_at: chargeData.created_at,
   };
@@ -510,10 +727,16 @@ function persistChargeState(
     cardholderName?: string | undefined;
     cardholderEmail?: string | undefined;
     isThirdPartyCard?: boolean | undefined;
+    paymentMethod?: string | undefined;
+    statusOverride?: string | undefined;
+    failureCode?: string | null | undefined;
+    failureMessage?: string | null | undefined;
     invoiceDescription?: string | undefined;
   },
 ): void {
   if (!chargeData?.id) return;
+  const chargeId = String(chargeData.id);
+  const existing = getPendingCharge(chargeId);
   const clientRef =
     opts?.clientRef ||
     (typeof chargeData?.metadata?.client_ref === 'string' && chargeData.metadata.client_ref
@@ -530,7 +753,7 @@ function persistChargeState(
           : undefined;
 
   savePendingCharge({
-    chargeId: String(chargeData.id),
+    chargeId,
     clientRef,
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -557,16 +780,27 @@ function persistChargeState(
         ? chargeData.metadata.cardholder_email
         : undefined),
     isThirdPartyCard: parsedThirdParty,
+    paymentMethod:
+      opts?.paymentMethod ||
+      existing?.paymentMethod ||
+      (typeof chargeData?.metadata?.payment_method === 'string' && chargeData.metadata.payment_method
+        ? chargeData.metadata.payment_method
+        : undefined),
+    authenticatedBy: getChargeAuthenticatedBy(chargeData) ?? existing?.authenticatedBy ?? null,
+    reversed:
+      typeof chargeData.reversed === 'boolean' ? chargeData.reversed : existing?.reversed,
     invoiceDescription:
       opts?.invoiceDescription ||
       (typeof chargeData.description === 'string' ? chargeData.description : undefined),
     amount: typeof chargeData.amount === 'number' ? chargeData.amount : undefined,
     currency: typeof chargeData.currency === 'string' ? chargeData.currency : undefined,
-    status: typeof chargeData.status === 'string' ? chargeData.status : undefined,
+    status:
+      opts?.statusOverride ||
+      (typeof chargeData.status === 'string' ? chargeData.status : undefined),
     paid: typeof chargeData.paid === 'boolean' ? chargeData.paid : undefined,
     authorized: typeof chargeData.authorized === 'boolean' ? chargeData.authorized : undefined,
-    failureCode: chargeData.failure_code ?? null,
-    failureMessage: chargeData.failure_message ?? null,
+    failureCode: opts?.failureCode ?? chargeData.failure_code ?? existing?.failureCode ?? null,
+    failureMessage: opts?.failureMessage ?? chargeData.failure_message ?? existing?.failureMessage ?? null,
   });
 }
 
@@ -686,7 +920,20 @@ const chargeApi = (): MiddlewareHandler => {
             }
           }
 
-          const updated = updateChargeFromWebhook(chargeData, event.id, event.key);
+          const cachedEntry = getPendingCharge(String(chargeData.id));
+          const finalized = await enforce3DSAndFinalizeCharge(chargeData, secretKey, {
+            cachedEntry,
+          });
+          const chargeForStore = finalized.rejectedBy3DSGuard
+            ? {
+              ...finalized.chargeData,
+              status: 'failed',
+              failure_code: finalized.failureCode,
+              failure_message: finalized.failureMessage,
+            }
+            : finalized.chargeData;
+
+          const updated = updateChargeFromWebhook(chargeForStore, event.id, event.key);
           console.info('Omise webhook processed:', {
             eventId: event.id,
             key: event.key,
@@ -945,9 +1192,19 @@ const chargeApi = (): MiddlewareHandler => {
         const customerName = customer?.name ? String(customer.name).trim() : '';
         const cardholderName = payer?.cardholder_name ? String(payer.cardholder_name).trim() : '';
         const cardholderEmail = payer?.cardholder_email ? String(payer.cardholder_email).trim() : '';
+        const cardholderPhone = payer?.cardholder_phone ? String(payer.cardholder_phone).trim() : '';
 
         if (cardholderEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail)) {
           return c.json({ error: 'Invalid cardholder email address' }, 400);
+        }
+        if (cardholderPhone && !/^\+[1-9]\d{6,14}$/.test(cardholderPhone)) {
+          return c.json(
+            {
+              error:
+                'Invalid cardholder phone number. Use international E.164 format (e.g. +6581234567).',
+            },
+            400,
+          );
         }
 
         const explicitThirdParty = Boolean(payer?.is_third_party_card);
@@ -987,11 +1244,20 @@ const chargeApi = (): MiddlewareHandler => {
         const isUsOrHighValue =
           billing?.country === 'US' || billing?.country === 'CA' || amount >= 100000;
 
+        // Enforce 3DS on standard cards via pre-authorization (capture: false):
+        // funds are only captured if Omise confirms authenticated_by is '3DS' or 'PASSKEY';
+        // otherwise the authorization hold is automatically reversed.
+        // Apple Pay uses native device biometric / cryptogram SCA and keeps capture: true.
+        const shouldEnforceManualCapture3DS =
+          OMISE_CONFIG.threeDS.required &&
+          OMISE_CONFIG.threeDS.enforceManualCaptureGuard &&
+          !is_apple_pay;
+
         const chargePayload: Record<string, any> = {
           amount: amount,
           currency: finalCurrency,
           return_uri: finalReturnUri,
-          capture: true,
+          capture: shouldEnforceManualCapture3DS ? false : true,
           description: invoiceDesc,
           metadata: {
             invoice_number: invoiceNumber,
@@ -1001,10 +1267,12 @@ const chargeApi = (): MiddlewareHandler => {
             customer_name: customerName,
             cardholder_name: cardholderName,
             cardholder_email: cardholderEmail,
+            cardholder_phone: cardholderPhone,
             is_third_party_card: isThirdPartyCard,
             charge_currency: finalCurrency.toUpperCase(),
             payment_method: is_apple_pay ? 'apple_pay' : 'card',
             three_ds_required: OMISE_CONFIG.threeDS.required,
+            three_ds_capture_guard: shouldEnforceManualCapture3DS,
             billing_country: billing?.country || '',
             billing_state: billing?.state || '',
             billing_city: billing?.city || '',
@@ -1077,8 +1345,13 @@ const chargeApi = (): MiddlewareHandler => {
           );
         }
 
+        const finalized = await enforce3DSAndFinalizeCharge(chargeData, secretKey, {
+          isApplePay: Boolean(is_apple_pay),
+        });
+        const paymentMethod = is_apple_pay ? 'apple_pay' : 'card';
+
         // Persist charge & client_ref mapping to disk store
-        persistChargeState(chargeData, {
+          persistChargeState(finalized.chargeData, {
           clientRef: typeof client_ref === 'string' ? client_ref : undefined,
           customerId: customerId || undefined,
           invoiceNumber: invoiceNumber || undefined,
@@ -1087,11 +1360,29 @@ const chargeApi = (): MiddlewareHandler => {
           cardholderName: cardholderName || undefined,
           cardholderEmail: cardholderEmail || undefined,
           isThirdPartyCard,
+          paymentMethod,
+          statusOverride: finalized.rejectedBy3DSGuard ? 'failed' : undefined,
+          failureCode: finalized.failureCode,
+          failureMessage: finalized.failureMessage,
           invoiceDescription: invoiceDesc || undefined,
         });
 
+        if (finalized.rejectedBy3DSGuard) {
+          return c.json(
+            {
+              error: finalized.failureMessage,
+              code: finalized.failureCode,
+              id: finalized.chargeData.id,
+              reversed: Boolean(finalized.chargeData.reversed),
+              authenticated_by: null,
+              three_ds_verified: false,
+            },
+            400,
+          );
+        }
+
         return c.json(
-          formatChargeResponse(chargeData, {
+            formatChargeResponse(finalized.chargeData, {
             clientRef: typeof client_ref === 'string' ? client_ref : undefined,
             customerId: customerId || undefined,
             invoiceNumber: invoiceNumber || undefined,
@@ -1101,6 +1392,7 @@ const chargeApi = (): MiddlewareHandler => {
             cardholderName: cardholderName || undefined,
             cardholderEmail: cardholderEmail || undefined,
             isThirdPartyCard,
+            paymentMethod,
             includeAuthRedirect: true,
           }),
         );
@@ -1177,7 +1469,17 @@ const chargeApi = (): MiddlewareHandler => {
           );
         }
 
-        persistChargeState(chargeData, {
+          const finalized = await enforce3DSAndFinalizeCharge(chargeData, secretKey, {
+            cachedEntry: entry,
+          });
+          const resolvedPaymentMethod =
+            entry.paymentMethod ||
+            (typeof finalized.chargeData?.metadata?.payment_method === 'string' &&
+              finalized.chargeData.metadata.payment_method
+              ? finalized.chargeData.metadata.payment_method
+              : 'card');
+
+          persistChargeState(finalized.chargeData, {
           clientRef: ref,
           customerId: entry.customerId,
           invoiceNumber: entry.invoiceNumber,
@@ -1186,11 +1488,15 @@ const chargeApi = (): MiddlewareHandler => {
           cardholderName: entry.cardholderName,
           cardholderEmail: entry.cardholderEmail,
           isThirdPartyCard: entry.isThirdPartyCard,
+          paymentMethod: resolvedPaymentMethod,
+          statusOverride: finalized.rejectedBy3DSGuard ? 'failed' : undefined,
+          failureCode: finalized.failureCode,
+          failureMessage: finalized.failureMessage,
           invoiceDescription: entry.invoiceDescription,
         });
 
         return c.json(
-          formatChargeResponse(chargeData, {
+            formatChargeResponse(finalized.chargeData, {
             customerId: entry.customerId,
             invoiceNumber: entry.invoiceNumber,
             invoiceDescription: entry.invoiceDescription,
@@ -1199,6 +1505,10 @@ const chargeApi = (): MiddlewareHandler => {
             cardholderName: entry.cardholderName,
             cardholderEmail: entry.cardholderEmail,
             isThirdPartyCard: entry.isThirdPartyCard,
+            paymentMethod: resolvedPaymentMethod,
+            forcedStatus: finalized.rejectedBy3DSGuard ? 'failed' : undefined,
+            forcedFailureCode: finalized.failureCode,
+            forcedFailureMessage: finalized.failureMessage,
           }),
         );
       } catch (err: any) {
@@ -1256,7 +1566,17 @@ const chargeApi = (): MiddlewareHandler => {
         }
 
         const cached = getPendingCharge(chargeId);
-        persistChargeState(chargeData, {
+          const finalized = await enforce3DSAndFinalizeCharge(chargeData, secretKey, {
+            cachedEntry: cached,
+          });
+          const resolvedPaymentMethod =
+            cached?.paymentMethod ||
+            (typeof finalized.chargeData?.metadata?.payment_method === 'string' &&
+              finalized.chargeData.metadata.payment_method
+              ? finalized.chargeData.metadata.payment_method
+              : 'card');
+
+          persistChargeState(finalized.chargeData, {
           clientRef: cached?.clientRef,
           customerId: cached?.customerId,
           invoiceNumber: cached?.invoiceNumber,
@@ -1265,11 +1585,15 @@ const chargeApi = (): MiddlewareHandler => {
           cardholderName: cached?.cardholderName,
           cardholderEmail: cached?.cardholderEmail,
           isThirdPartyCard: cached?.isThirdPartyCard,
+          paymentMethod: resolvedPaymentMethod,
+          statusOverride: finalized.rejectedBy3DSGuard ? 'failed' : undefined,
+          failureCode: finalized.failureCode,
+          failureMessage: finalized.failureMessage,
           invoiceDescription: cached?.invoiceDescription,
         });
 
         return c.json(
-          formatChargeResponse(chargeData, {
+            formatChargeResponse(finalized.chargeData, {
             customerId: cached?.customerId,
             invoiceNumber: cached?.invoiceNumber,
             invoiceDescription: cached?.invoiceDescription,
@@ -1278,6 +1602,10 @@ const chargeApi = (): MiddlewareHandler => {
             cardholderName: cached?.cardholderName,
             cardholderEmail: cached?.cardholderEmail,
             isThirdPartyCard: cached?.isThirdPartyCard,
+            paymentMethod: resolvedPaymentMethod,
+            forcedStatus: finalized.rejectedBy3DSGuard ? 'failed' : undefined,
+            forcedFailureCode: finalized.failureCode,
+            forcedFailureMessage: finalized.failureMessage,
           }),
         );
       } catch (err: any) {

@@ -98,7 +98,10 @@ export const OMISE_CONFIG = {
   // 3D Secure 2.0 配置
   threeDS: {
     required: true,            // 生产环境强制要求 3DS
-    enforceForApplePay: true,
+    // Apple Pay 在 Omise SG 按原生设备生物识别 + Cryptogram 走非 3DS 通道，不能按 authenticated_by === '3DS' 拦截撤单
+    enforceForApplePay: false,
+    // 对普通银行卡启用预授权守卫（capture: false -> 校验 authenticated_by === '3DS'/'PASSKEY' -> 捕获或撤单）
+    enforceManualCaptureGuard: true,
     defaultReturnPath: '/payment',
   },
 } as const;

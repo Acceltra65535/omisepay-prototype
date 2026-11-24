@@ -13,6 +13,9 @@ export interface StoredChargeEntry {
   cardholderName?: string | undefined;
   cardholderEmail?: string | undefined;
   isThirdPartyCard?: boolean | undefined;
+  paymentMethod?: string | undefined;
+  authenticatedBy?: string | null | undefined;
+  reversed?: boolean | undefined;
   invoiceDescription?: string | undefined;
   amount?: number | undefined;
   currency?: string | undefined;
@@ -243,10 +246,27 @@ export function updateChargeFromWebhook(
         ? chargeData.metadata.cardholder_email
         : undefined),
     isThirdPartyCard: existing?.isThirdPartyCard ?? parsedThirdParty,
+    paymentMethod:
+      existing?.paymentMethod ||
+      (typeof chargeData?.metadata?.payment_method === 'string' && chargeData.metadata.payment_method
+        ? chargeData.metadata.payment_method
+        : undefined),
+    authenticatedBy:
+      typeof chargeData.authenticated_by === 'string' && chargeData.authenticated_by
+        ? chargeData.authenticated_by
+        : existing?.authenticatedBy ?? null,
+    reversed:
+      typeof chargeData.reversed === 'boolean' ? chargeData.reversed : existing?.reversed,
     invoiceDescription: existing?.invoiceDescription || (typeof chargeData.description === 'string' ? chargeData.description : undefined),
     amount: typeof chargeData.amount === 'number' ? chargeData.amount : existing?.amount,
     currency: typeof chargeData.currency === 'string' ? chargeData.currency : existing?.currency,
-    status: typeof chargeData.status === 'string' ? chargeData.status : existing?.status,
+    status:
+      existing?.failureCode === 'three_ds_authentication_required' &&
+        (chargeData.reversed || chargeData.status === 'reversed')
+        ? 'failed'
+        : typeof chargeData.status === 'string'
+          ? chargeData.status
+          : existing?.status,
     paid: typeof chargeData.paid === 'boolean' ? chargeData.paid : existing?.paid,
     authorized: typeof chargeData.authorized === 'boolean' ? chargeData.authorized : existing?.authorized,
     failureCode: chargeData.failure_code ?? existing?.failureCode ?? null,
