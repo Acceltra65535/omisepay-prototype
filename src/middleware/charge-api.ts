@@ -202,6 +202,9 @@ function formatChargeResponse(
     invoiceDescription?: string | undefined;
     customerEmail?: string | undefined;
     customerName?: string | undefined;
+    cardholderName?: string | undefined;
+    cardholderEmail?: string | undefined;
+    isThirdPartyCard?: boolean | undefined;
     includeAuthRedirect?: boolean | undefined;
   },
 ) {
@@ -213,6 +216,21 @@ function formatChargeResponse(
     opts?.customerName ||
     (chargeData.metadata && chargeData.metadata.customer_name) ||
     null;
+
+  const resolvedCardholderName =
+    opts?.cardholderName ||
+    (chargeData.metadata && chargeData.metadata.cardholder_name) ||
+    (chargeData.card && chargeData.card.name) ||
+    null;
+  const resolvedCardholderEmail =
+    opts?.cardholderEmail ||
+    (chargeData.metadata && chargeData.metadata.cardholder_email) ||
+    null;
+  const metaThirdParty = chargeData.metadata?.is_third_party_card;
+  const resolvedIsThirdParty =
+    typeof opts?.isThirdPartyCard === 'boolean'
+      ? opts.isThirdPartyCard
+      : metaThirdParty === true || metaThirdParty === 'true';
 
   const base: Record<string, any> = {
     id: chargeData.id,
@@ -234,10 +252,17 @@ function formatChargeResponse(
       (chargeData.metadata && chargeData.metadata.invoice_number) ||
       null,
     invoice_description: opts?.invoiceDescription || chargeData.description || null,
-    customer: email
+    customer: (email || name)
       ? {
-          email,
-          name,
+          email: email || null,
+          name: name || null,
+        }
+      : null,
+    payer: (resolvedCardholderName || resolvedCardholderEmail || resolvedIsThirdParty)
+      ? {
+          cardholder_name: resolvedCardholderName,
+          cardholder_email: resolvedCardholderEmail,
+          is_third_party_card: resolvedIsThirdParty,
         }
       : null,
     card: chargeData.card
@@ -273,6 +298,7 @@ function buildUnsupportedBrandMessage(brand: string, currency: SupportedCurrency
 /**
  * Resolve an existing Omise Customer by email (cache -> Omise Search API) and attach the new card,
  * or create a new Customer entity when no existing record exists.
+ * Stores strictly customer identity (never mixes third-party card billing addresses).
  */
 async function resolveOrCreateCustomer(params: {
   secretKey: string;
@@ -283,7 +309,6 @@ async function resolveOrCreateCustomer(params: {
   invoiceNumber: string;
   clientIp: string;
   userAgent: string;
-  billing: Record<string, any> | undefined;
 }): Promise<
   | { ok: true; customerId: string | null; cardId: string | null }
   | { ok: false; status: ContentfulStatusCode; error: string; code: string }
@@ -297,7 +322,6 @@ async function resolveOrCreateCustomer(params: {
     invoiceNumber,
     clientIp,
     userAgent,
-    billing,
   } = params;
 
   const normalizedEmail = customerEmail.trim().toLowerCase();
@@ -309,17 +333,12 @@ async function resolveOrCreateCustomer(params: {
     customerDescParts.length > 0 ? customerDescParts.join(' ') : `Customer ${customerEmail}`;
 
   const metadataPayload = {
-    name: customerName,
+    customer_name: customerName,
     invoice_number: invoiceNumber,
     last_invoice_number: invoiceNumber,
     registration_ip: clientIp,
     last_ip: clientIp,
     user_agent: userAgent,
-    billing_country: billing?.country || '',
-    billing_state: billing?.state || '',
-    billing_city: billing?.city || '',
-    billing_postal_code: billing?.postal_code || '',
-    billing_street1: billing?.street1 || '',
   };
 
   let existingCustId = getCachedCustomerIdByEmail(normalizedEmail);
@@ -488,6 +507,9 @@ function persistChargeState(
     invoiceNumber?: string | undefined;
     customerEmail?: string | undefined;
     customerName?: string | undefined;
+    cardholderName?: string | undefined;
+    cardholderEmail?: string | undefined;
+    isThirdPartyCard?: boolean | undefined;
     invoiceDescription?: string | undefined;
   },
 ): void {
@@ -497,6 +519,15 @@ function persistChargeState(
     (typeof chargeData?.metadata?.client_ref === 'string' && chargeData.metadata.client_ref
       ? chargeData.metadata.client_ref
       : undefined);
+  const metaThirdParty = chargeData?.metadata?.is_third_party_card;
+  const parsedThirdParty =
+    typeof opts?.isThirdPartyCard === 'boolean'
+      ? opts.isThirdPartyCard
+      : typeof metaThirdParty === 'boolean'
+        ? metaThirdParty
+        : metaThirdParty === 'true'
+          ? true
+          : undefined;
 
   savePendingCharge({
     chargeId: String(chargeData.id),
@@ -513,6 +544,19 @@ function persistChargeState(
     customerName:
       opts?.customerName ||
       (typeof chargeData?.metadata?.customer_name === 'string' ? chargeData.metadata.customer_name : undefined),
+    cardholderName:
+      opts?.cardholderName ||
+      (typeof chargeData?.metadata?.cardholder_name === 'string' && chargeData.metadata.cardholder_name
+        ? chargeData.metadata.cardholder_name
+        : typeof chargeData?.card?.name === 'string'
+          ? chargeData.card.name
+          : undefined),
+    cardholderEmail:
+      opts?.cardholderEmail ||
+      (typeof chargeData?.metadata?.cardholder_email === 'string' && chargeData.metadata.cardholder_email
+        ? chargeData.metadata.cardholder_email
+        : undefined),
+    isThirdPartyCard: parsedThirdParty,
     invoiceDescription:
       opts?.invoiceDescription ||
       (typeof chargeData.description === 'string' ? chargeData.description : undefined),
@@ -813,6 +857,7 @@ const chargeApi = (): MiddlewareHandler => {
           return_uri,
           client_ref,
           customer,
+          payer,
           invoice,
           billing,
           is_apple_pay,
@@ -892,12 +937,27 @@ const chargeApi = (): MiddlewareHandler => {
         const userAgent = getClientUserAgent(c) || (body.user_agent ? String(body.user_agent).trim() : '');
         const acceptLanguage = getClientAcceptLanguage(c);
 
-        // Step 1: Resolve or Create Customer Entity (deduplicated by email)
+        // Step 1: Resolve or Create Customer Entity (strictly for the customer, never binding third-party cards)
         let customerId: string | null = null;
         let cardId: string | null = null;
 
         const customerEmail = customer?.email ? String(customer.email).trim() : '';
         const customerName = customer?.name ? String(customer.name).trim() : '';
+        const cardholderName = payer?.cardholder_name ? String(payer.cardholder_name).trim() : '';
+        const cardholderEmail = payer?.cardholder_email ? String(payer.cardholder_email).trim() : '';
+
+        if (cardholderEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail)) {
+          return c.json({ error: 'Invalid cardholder email address' }, 400);
+        }
+
+        const explicitThirdParty = Boolean(payer?.is_third_party_card);
+        const nameMismatchThirdParty = Boolean(
+          customerName &&
+          cardholderName &&
+          customerName.toLowerCase() !== cardholderName.toLowerCase(),
+        );
+        const isThirdPartyCard = explicitThirdParty || nameMismatchThirdParty;
+
         const invoiceNumber = invoice?.invoice_number ? String(invoice.invoice_number).trim() : '';
         const invoiceDesc = invoice?.description
           ? String(invoice.description).trim()
@@ -905,7 +965,7 @@ const chargeApi = (): MiddlewareHandler => {
             ? `Invoice #${invoiceNumber}`
             : 'Credit Card Payment';
 
-        if (customerEmail && !is_apple_pay) {
+        if (customerEmail && !is_apple_pay && !isThirdPartyCard) {
           const custResult = await resolveOrCreateCustomer({
             secretKey,
             token,
@@ -915,7 +975,6 @@ const chargeApi = (): MiddlewareHandler => {
             invoiceNumber,
             clientIp,
             userAgent,
-            billing,
           });
           if (!custResult.ok) {
             return c.json({ error: custResult.error, code: custResult.code }, custResult.status);
@@ -924,7 +983,7 @@ const chargeApi = (): MiddlewareHandler => {
           cardId = custResult.cardId;
         }
 
-        // Step 2: Create Charge with mandatory return_uri & full 3DS context
+        // Step 2: Create Charge with mandatory return_uri & separated Customer / Cardholder context
         const isUsOrHighValue =
           billing?.country === 'US' || billing?.country === 'CA' || amount >= 100000;
 
@@ -940,6 +999,9 @@ const chargeApi = (): MiddlewareHandler => {
             customer_id: customerId || '',
             customer_email: customerEmail,
             customer_name: customerName,
+            cardholder_name: cardholderName,
+            cardholder_email: cardholderEmail,
+            is_third_party_card: isThirdPartyCard,
             charge_currency: finalCurrency.toUpperCase(),
             payment_method: is_apple_pay ? 'apple_pay' : 'card',
             three_ds_required: OMISE_CONFIG.threeDS.required,
@@ -1022,6 +1084,9 @@ const chargeApi = (): MiddlewareHandler => {
           invoiceNumber: invoiceNumber || undefined,
           customerEmail: customerEmail || undefined,
           customerName: customerName || undefined,
+          cardholderName: cardholderName || undefined,
+          cardholderEmail: cardholderEmail || undefined,
+          isThirdPartyCard,
           invoiceDescription: invoiceDesc || undefined,
         });
 
@@ -1033,6 +1098,9 @@ const chargeApi = (): MiddlewareHandler => {
             invoiceDescription: invoiceDesc,
             customerEmail: customerEmail || undefined,
             customerName: customerName || undefined,
+            cardholderName: cardholderName || undefined,
+            cardholderEmail: cardholderEmail || undefined,
+            isThirdPartyCard,
             includeAuthRedirect: true,
           }),
         );
@@ -1115,6 +1183,9 @@ const chargeApi = (): MiddlewareHandler => {
           invoiceNumber: entry.invoiceNumber,
           customerEmail: entry.customerEmail,
           customerName: entry.customerName,
+          cardholderName: entry.cardholderName,
+          cardholderEmail: entry.cardholderEmail,
+          isThirdPartyCard: entry.isThirdPartyCard,
           invoiceDescription: entry.invoiceDescription,
         });
 
@@ -1125,6 +1196,9 @@ const chargeApi = (): MiddlewareHandler => {
             invoiceDescription: entry.invoiceDescription,
             customerEmail: entry.customerEmail,
             customerName: entry.customerName,
+            cardholderName: entry.cardholderName,
+            cardholderEmail: entry.cardholderEmail,
+            isThirdPartyCard: entry.isThirdPartyCard,
           }),
         );
       } catch (err: any) {
@@ -1136,7 +1210,7 @@ const chargeApi = (): MiddlewareHandler => {
     // GET /api/charge/:id — Retrieve charge status by charge ID
     // ──────────────────────────────────────────────────
     const chargeIdMatch = c.req.path.match(
-      /^\/api\/charge\/(chrg_[a-zA-Z0-9]+)$/,
+      /^\/api\/charge\/(chrg_[a-zA-Z0-9_]+)$/,
     );
     if (chargeIdMatch && c.req.method === 'GET') {
       const secretKey = getSecretKey();
@@ -1188,6 +1262,9 @@ const chargeApi = (): MiddlewareHandler => {
           invoiceNumber: cached?.invoiceNumber,
           customerEmail: cached?.customerEmail,
           customerName: cached?.customerName,
+          cardholderName: cached?.cardholderName,
+          cardholderEmail: cached?.cardholderEmail,
+          isThirdPartyCard: cached?.isThirdPartyCard,
           invoiceDescription: cached?.invoiceDescription,
         });
 
@@ -1198,6 +1275,9 @@ const chargeApi = (): MiddlewareHandler => {
             invoiceDescription: cached?.invoiceDescription,
             customerEmail: cached?.customerEmail,
             customerName: cached?.customerName,
+            cardholderName: cached?.cardholderName,
+            cardholderEmail: cached?.cardholderEmail,
+            isThirdPartyCard: cached?.isThirdPartyCard,
           }),
         );
       } catch (err: any) {

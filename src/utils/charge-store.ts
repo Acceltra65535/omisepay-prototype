@@ -10,6 +10,9 @@ export interface StoredChargeEntry {
   invoiceNumber?: string | undefined;
   customerEmail?: string | undefined;
   customerName?: string | undefined;
+  cardholderName?: string | undefined;
+  cardholderEmail?: string | undefined;
+  isThirdPartyCard?: boolean | undefined;
   invoiceDescription?: string | undefined;
   amount?: number | undefined;
   currency?: string | undefined;
@@ -210,6 +213,14 @@ export function updateChargeFromWebhook(
       ? chargeData.metadata.client_ref
       : undefined;
 
+  const metaThirdParty = chargeData?.metadata?.is_third_party_card;
+  const parsedThirdParty =
+    typeof metaThirdParty === 'boolean'
+      ? metaThirdParty
+      : metaThirdParty === 'true'
+        ? true
+        : undefined;
+
   const updated: StoredChargeEntry = {
     chargeId,
     clientRef: existing?.clientRef || metaClientRef,
@@ -219,6 +230,19 @@ export function updateChargeFromWebhook(
     invoiceNumber: existing?.invoiceNumber || (typeof chargeData?.metadata?.invoice_number === 'string' ? chargeData.metadata.invoice_number : undefined),
     customerEmail: existing?.customerEmail || (typeof chargeData?.metadata?.customer_email === 'string' ? chargeData.metadata.customer_email : undefined),
     customerName: existing?.customerName || (typeof chargeData?.metadata?.customer_name === 'string' ? chargeData.metadata.customer_name : undefined),
+    cardholderName:
+      existing?.cardholderName ||
+      (typeof chargeData?.metadata?.cardholder_name === 'string' && chargeData.metadata.cardholder_name
+        ? chargeData.metadata.cardholder_name
+        : typeof chargeData?.card?.name === 'string'
+          ? chargeData.card.name
+          : undefined),
+    cardholderEmail:
+      existing?.cardholderEmail ||
+      (typeof chargeData?.metadata?.cardholder_email === 'string' && chargeData.metadata.cardholder_email
+        ? chargeData.metadata.cardholder_email
+        : undefined),
+    isThirdPartyCard: existing?.isThirdPartyCard ?? parsedThirdParty,
     invoiceDescription: existing?.invoiceDescription || (typeof chargeData.description === 'string' ? chargeData.description : undefined),
     amount: typeof chargeData.amount === 'number' ? chargeData.amount : existing?.amount,
     currency: typeof chargeData.currency === 'string' ? chargeData.currency : existing?.currency,

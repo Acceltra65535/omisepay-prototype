@@ -43,9 +43,14 @@ interface ChargeResult {
   invoice_number?: string | null;
   invoice_description?: string | null;
   customer?: {
-    email: string;
+    email?: string | null;
     name?: string | null;
     phone?: string | null;
+  } | null;
+  payer?: {
+    cardholder_name?: string | null;
+    cardholder_email?: string | null;
+    is_third_party_card?: boolean;
   } | null;
   card?: {
     last_digits: string;
@@ -175,9 +180,10 @@ function getCountryDialCode(countryCode: string): string {
 // ── Main Payment Form Component ─────────────────────────────
 
 export const PaymentForm = () => {
-  // Stripe Invoicing & Customer Entity Fields
+  // Customer & Order Identity Fields (separated from Cardholder / Payment Info)
   const [invoiceNumber, setInvoiceNumber] = useState(() => `INV-2026-${Math.floor(1000 + Math.random() * 9000)}`);
   const [invoiceDescription, setInvoiceDescription] = useState('Professional Consulting Services');
+  const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
 
   // Payment Currency & Amount (SGD default, plus USD and CAD)
@@ -186,8 +192,10 @@ export const PaymentForm = () => {
   const [amount, setAmount] = useState('1500.00');
   const [exchangeRates, setExchangeRates] = useState<ExchangeRatesData | null>(null);
 
-  // Card Details
-  const [name, setName] = useState('');
+  // Cardholder & Card Payment Details (can belong to a third-party cardholder)
+  const [isThirdPartyCard, setIsThirdPartyCard] = useState(false);
+  const [cardholderName, setCardholderName] = useState('');
+  const [cardholderEmail, setCardholderEmail] = useState('');
   const [cardNumber, setCardNumber] = useState('');
   const [expiry, setExpiry] = useState('');
   const [cvc, setCvc] = useState('');
@@ -444,22 +452,32 @@ export const PaymentForm = () => {
       errors.amount = `Maximum amount is ${symbol}20,000.00`;
     }
 
-    // 2. Stripe Invoicing & Customer Entity Validation
+    // 2. Customer Information Validation (Order / Receipt Owner)
+    if (!customerName.trim()) {
+      errors.customerName = 'Customer full name is required';
+    } else if (customerName.trim().length < 2) {
+      errors.customerName = 'Customer name is too short';
+    }
+
     if (!customerEmail.trim()) {
-      errors.customerEmail = 'Customer email is required for payment receipt & bank authorization';
+      errors.customerEmail = 'Customer email is required for payment receipt & order confirmation';
     } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail.trim())) {
-      errors.customerEmail = 'Please enter a valid email address';
+      errors.customerEmail = 'Please enter a valid customer email address';
     }
 
     if (!invoiceNumber.trim()) {
       errors.invoiceNumber = 'Invoice reference number is required';
     }
 
-    // 3. Cardholder Name
-    if (!name.trim()) {
-      errors.name = 'Cardholder name is required';
-    } else if (name.trim().length < 2) {
-      errors.name = 'Cardholder name is too short';
+    // 3. Cardholder Information Validation (Payment Owner)
+    if (!cardholderName.trim()) {
+      errors.cardholderName = 'Cardholder name is required (as printed on the card)';
+    } else if (cardholderName.trim().length < 2) {
+      errors.cardholderName = 'Cardholder name is too short';
+    }
+
+    if (isThirdPartyCard && cardholderEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail.trim())) {
+      errors.cardholderEmail = 'Please enter a valid cardholder email address';
     }
 
     // 4. Card Number
@@ -529,11 +547,14 @@ export const PaymentForm = () => {
     return { valid, mainError, errors };
   }, [
     amount,
+    customerName,
     customerEmail,
     country,
     isHighValue,
     invoiceNumber,
-    name,
+    cardholderName,
+    cardholderEmail,
+    isThirdPartyCard,
     cardNumber,
     expiry,
     cvc,
@@ -559,6 +580,14 @@ export const PaymentForm = () => {
     }
     if (amt > 20000.0) {
       setError(`Amount exceeds maximum (${currencyConfig.symbol}20,000.00) for Apple Pay.`);
+      return;
+    }
+    if (customerEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail.trim())) {
+      setError('Please enter a valid customer email address before using Apple Pay.');
+      return;
+    }
+    if (isThirdPartyCard && cardholderEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail.trim())) {
+      setError('Please enter a valid cardholder email address before using Apple Pay.');
       return;
     }
 
@@ -659,7 +688,20 @@ export const PaymentForm = () => {
               client_ref: clientRef,
               is_apple_pay: true,
               card_brand: applePayNetwork || undefined,
-              customer: customerEmail ? { email: customerEmail } : undefined,
+              customer:
+                customerName.trim() || customerEmail.trim()
+                  ? {
+                      name: customerName.trim() || undefined,
+                      email: customerEmail.trim() || undefined,
+                    }
+                  : undefined,
+              payer: {
+                is_third_party_card: isThirdPartyCard,
+                cardholder_email:
+                  isThirdPartyCard && cardholderEmail.trim()
+                    ? cardholderEmail.trim()
+                    : undefined,
+              },
               invoice: {
                 invoice_number: invoiceNumber.trim() || undefined,
                 description: invoiceDescription.trim() || undefined,
@@ -753,7 +795,7 @@ export const PaymentForm = () => {
         );
 
         const tokenCardData: Record<string, string | number> = {
-          name: name.trim(),
+          name: cardholderName.trim(),
           number: digits,
           expiration_month: expirationMonth,
           expiration_year: expirationYear,
@@ -793,7 +835,7 @@ export const PaymentForm = () => {
           );
         });
 
-        // Step 2: Create Customer Entity and Charge with Invoicing Context
+        // Step 2: Create Customer Entity (when own card) and Charge with separated Customer & Payer info
         setStatus('charging');
         const amountInCents = Math.round(parseFloat(amount) * 100);
 
@@ -801,6 +843,10 @@ export const PaymentForm = () => {
           'om_ref_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
         const returnUri =
           window.location.origin + window.location.pathname + '?ref=' + clientRef;
+
+        const effectiveThirdParty =
+          isThirdPartyCard ||
+          customerName.trim().toLowerCase() !== cardholderName.trim().toLowerCase();
 
         const chargeResponse = await fetch('/api/charge', {
           method: 'POST',
@@ -813,8 +859,16 @@ export const PaymentForm = () => {
             client_ref: clientRef,
             card_brand: cardBrand || undefined,
             customer: {
+              name: customerName.trim(),
               email: customerEmail.trim(),
-              name: name.trim(),
+            },
+            payer: {
+              cardholder_name: cardholderName.trim(),
+              cardholder_email:
+                isThirdPartyCard && cardholderEmail.trim()
+                  ? cardholderEmail.trim()
+                  : undefined,
+              is_third_party_card: effectiveThirdParty,
             },
             invoice: {
               invoice_number: invoiceNumber.trim(),
@@ -857,13 +911,16 @@ export const PaymentForm = () => {
       }
     },
     [
-      name,
+      customerName,
+      customerEmail,
+      cardholderName,
+      cardholderEmail,
+      isThirdPartyCard,
       cardNumber,
       cardBrand,
       expiry,
       cvc,
       amount,
-      customerEmail,
       invoiceNumber,
       invoiceDescription,
       country,
@@ -881,12 +938,15 @@ export const PaymentForm = () => {
 
   const handleReset = () => {
     setInvoiceNumber(`INV-2026-${Math.floor(1000 + Math.random() * 9000)}`);
-    setName('');
+    setCustomerName('');
+    setCustomerEmail('');
+    setIsThirdPartyCard(false);
+    setCardholderName('');
+    setCardholderEmail('');
     setCardNumber('');
     setExpiry('');
     setCvc('');
     setAmount('1500.00');
-    setCustomerEmail('');
     setCountry('US');
     setStreet1('');
     setStreet2('');
@@ -1028,11 +1088,38 @@ export const PaymentForm = () => {
               </div>
             )}
             <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Customer Email</span>
-              <span className="text-slate-800">
-                {chargeResult.customer?.email || customerEmail}
+              <span className="text-slate-500">Customer Name</span>
+              <span className="text-slate-800 font-medium">
+                {chargeResult.customer?.name || customerName || '—'}
               </span>
             </div>
+            <div className="flex justify-between py-1 border-b border-slate-100">
+              <span className="text-slate-500">Customer Email</span>
+              <span className="text-slate-800">
+                {chargeResult.customer?.email || customerEmail || '—'}
+              </span>
+            </div>
+            {(chargeResult.payer?.cardholder_name || chargeResult.card?.name || cardholderName) && (
+              <div className="flex justify-between items-center py-1 border-b border-slate-100">
+                <span className="text-slate-500">Cardholder Name</span>
+                <span className="flex items-center gap-2 text-slate-800 font-medium">
+                  <span>{chargeResult.payer?.cardholder_name || chargeResult.card?.name || cardholderName}</span>
+                  {chargeResult.payer?.is_third_party_card && (
+                    <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+                      Third-Party Card
+                    </span>
+                  )}
+                </span>
+              </div>
+            )}
+            {chargeResult.payer?.cardholder_email && (
+              <div className="flex justify-between py-1 border-b border-slate-100">
+                <span className="text-slate-500">Cardholder Email</span>
+                <span className="text-slate-800">
+                  {chargeResult.payer.cardholder_email}
+                </span>
+              </div>
+            )}
             <div className="flex justify-between py-1 border-b border-slate-100">
               <span className="text-slate-500">Transaction ID</span>
               <span className="font-mono text-xs text-slate-700">
@@ -1204,108 +1291,122 @@ export const PaymentForm = () => {
           </div>
         </div>
 
-        {/* US High-Value Anti-Fraud Compliance Shield */}
+        {/* High-Value Anti-Fraud Compliance Shield */}
         {isHighValue && (
           <div className="mb-6 rounded-xl border border-indigo-200 bg-gradient-to-r from-indigo-50/90 via-blue-50/70 to-slate-50 p-4 text-xs text-indigo-950 shadow-sm">
             <div className="flex items-start gap-3">
               <span className="text-xl">🏛️</span>
               <div className="space-y-1">
                 <span className="font-bold text-indigo-900">
-                  US High-Value Transaction Anti-Fraud Shield
+                  High-Value Transaction Anti-Fraud Shield
                 </span>
                 <p className="text-slate-600 leading-relaxed">
-                  In compliance with US card network (Visa / Mastercard / Amex) standards, a registered <strong>Customer Entity</strong> with verified AVS address and Level 2 Invoice metadata is attached. This maximizes authorization approval rates and prevents false-positive fraud declines from US issuing banks (Chase, Citi, BofA, Wells Fargo, Amex).
+                  In compliance with international card network (Visa / Mastercard / JCB) standards, Customer order identity and Cardholder AVS billing verification are kept strictly separated with Level 2 Invoice metadata and mandatory 3D Secure 2.0. This maximizes approval rates even when paying with a third-party card.
                 </p>
               </div>
             </div>
           </div>
         )}
 
-        {isApplePayAvailable && (
-          <div className="mb-8">
-            <button
-              type="button"
-              onClick={handleApplePay}
-              disabled={isProcessing}
-              className="w-full flex items-center justify-center gap-2 rounded-xl bg-black px-4 py-3.5 font-bold text-white shadow-md transition-all hover:bg-slate-900 focus:outline-none focus:ring-4 focus:ring-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <svg viewBox="0 0 40 16" width="40" height="16" fill="currentColor">
-                <path d="M14.93,7.21c0-1.63,1.33-2.61,2.58-3.23c-0.8-1.17-2.06-1.57-2.91-1.6c-1.24-0.12-2.43,0.73-3.06,0.73c-0.64,0-1.62-0.71-2.65-0.69C7.45,2.44,6.13,3.25,5.34,4.61c-1.6,2.78-0.41,6.89,1.15,9.15c0.76,1.11,1.67,2.33,2.87,2.29c1.17-0.04,1.61-0.75,3.02-0.75c1.4,0,1.81,0.75,3.04,0.73c1.24-0.02,2.02-1.11,2.78-2.22c0.88-1.29,1.24-2.54,1.26-2.61C19.41,11.18,14.93,9.45,14.93,7.21 M11.83,1.6C12.48,0.81,12.91,0,12.8-1.02C11.9,1.06,10.66,1.52,9.97,2.32c-0.6,0.7-1.12,1.59-0.97,2.58C10.02,4.98,11.23,4.41,11.83,1.6 M27.86,4.67v8.9h2.3v-8.9H27.86 M24.3,9.12c0-2.31-1.87-4.18-4.18-4.18c-2.31,0-4.18,1.87-4.18,4.18c0,2.31,1.87,4.18,4.18,4.18C22.43,13.3,24.3,11.43,24.3,9.12 M22.25,9.12c0,1.18-0.95,2.13-2.13,2.13c-1.18,0-2.13-0.95-2.13-2.13c0-1.18,0.95-2.13,2.13-2.13C21.3,6.99,22.25,7.94,22.25,9.12 M39.06,8.74c0-0.79-0.64-1.43-1.43-1.43h-2.92v4.86c0,0.79,0.64,1.43,1.43,1.43c0.79,0,1.43-0.64,1.43-1.43V8.74z M36.14,9.37V6.01h1.49v3.36H36.14z M32.65,11.05V2.32h2.05v8.73H32.65" />
-              </svg>
-              Pay with Apple Pay
-            </button>
-            <div className="relative mt-6">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-slate-200"></div>
-              </div>
-              <div className="relative flex justify-center text-sm">
-                <span className="bg-white px-3 text-slate-500 font-medium">Or pay with credit card</span>
+        <form onSubmit={handleSubmit} className="space-y-6">
+          {/* ═══════════════════════════════════════════════ */}
+          {/* Step 1: Customer & Order Information            */}
+          {/* ═══════════════════════════════════════════════ */}
+          <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-4 sm:p-5 space-y-4">
+            <div className="flex items-start justify-between gap-3 border-b border-slate-200/70 pb-3">
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-xs font-bold text-white">
+                  1
+                </span>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-800">
+                    Customer & Order Information
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Who this invoice belongs to (receives the receipt & order confirmation).
+                  </p>
+                </div>
               </div>
             </div>
-          </div>
-        )}
 
-        <form onSubmit={handleSubmit} className="space-y-5">
-          {/* Amount Field */}
-          <div>
-            <div className="flex items-center justify-between mb-1.5">
-              <label htmlFor="amount" className="block text-sm font-medium text-slate-700">
-                Payment Amount ({currencyConfig.code.toUpperCase()})
-              </label>
-              {currencyReference && (
-                <span className="text-xs font-medium text-slate-400">
-                  {currencyReference.primary}
+            {/* Amount Field */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label htmlFor="amount" className="block text-sm font-medium text-slate-700">
+                  Payment Amount ({currencyConfig.code.toUpperCase()})
+                </label>
+                {currencyReference && (
+                  <span className="text-xs font-medium text-slate-400">
+                    {currencyReference.primary}
+                  </span>
+                )}
+              </div>
+              <div className="relative">
+                <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-bold text-slate-500">
+                  {currencyConfig.symbol}
                 </span>
+                <input
+                  id="amount"
+                  type="text"
+                  inputMode="decimal"
+                  value={amount}
+                  onChange={(e) => {
+                    setAmount(e.target.value.replace(/[^0-9.]/g, ''));
+                    if (fieldErrors.amount) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.amount;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('amount') + (currencyConfig.symbol.length > 2 ? ' pl-14' : ' pl-11') + ' font-medium text-base bg-white'}
+                  placeholder="0.00"
+                  disabled={isProcessing}
+                />
+              </div>
+              {fieldErrors.amount ? (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.amount}</p>
+              ) : (
+                <p className="mt-1 text-xs text-slate-400">
+                  Minimum {currencyConfig.symbol}1.00 · Maximum {currencyConfig.symbol}20,000.00 {currencyConfig.code.toUpperCase()}
+                </p>
               )}
             </div>
-            <div className="relative">
-              <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-bold text-slate-500">
-                {currencyConfig.symbol}
-              </span>
-              <input
-                id="amount"
-                type="text"
-                inputMode="decimal"
-                value={amount}
-                onChange={(e) => {
-                  setAmount(e.target.value.replace(/[^0-9.]/g, ''));
-                  if (fieldErrors.amount) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.amount;
-                      return next;
-                    });
-                  }
-                }}
-                className={getInputClass('amount') + (currencyConfig.symbol.length > 2 ? ' pl-14' : ' pl-11') + ' font-medium text-base'}
-                placeholder="0.00"
-                disabled={isProcessing}
-              />
-            </div>
-            {fieldErrors.amount ? (
-              <p className="mt-1 text-xs text-red-500">{fieldErrors.amount}</p>
-            ) : (
-              <p className="mt-1 text-xs text-slate-400">
-                Minimum {currencyConfig.symbol}1.00 · Maximum {currencyConfig.symbol}20,000.00 {currencyConfig.code.toUpperCase()}
-              </p>
-            )}
-          </div>
 
-          {/* ═══════════════════════════════════════════════ */}
-          {/* Section 1: Customer Identity & Invoicing        */}
-          {/* (Creates explicit Customer entity in Omise)    */}
-          {/* ═══════════════════════════════════════════════ */}
-          <div className="space-y-4 pt-1">
-            <div className="flex items-center gap-2">
-              <div className="h-px flex-1 bg-slate-100" />
-              <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                Customer & Invoice Identity
-              </span>
-              <div className="h-px flex-1 bg-slate-100" />
-            </div>
-
-            {/* Customer Email & Invoice Memo Grid */}
+            {/* Customer Name & Customer Email Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="customer_name" className="mb-1.5 block text-sm font-medium text-slate-700">
+                  Customer Full Name <span className="text-red-500">*</span>
+                </label>
+                <input
+                  id="customer_name"
+                  type="text"
+                  value={customerName}
+                  onChange={(e) => {
+                    setCustomerName(e.target.value);
+                    if (fieldErrors.customerName) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.customerName;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('customerName') + ' bg-white'}
+                  placeholder="e.g. Alex Chen"
+                  autoComplete="name"
+                  maxLength={70}
+                  disabled={isProcessing}
+                />
+                {fieldErrors.customerName ? (
+                  <p className="mt-1 text-xs text-red-500">{fieldErrors.customerName}</p>
+                ) : (
+                  <p className="mt-1 text-xs text-slate-400">Order / invoice recipient name</p>
+                )}
+              </div>
+
               <div>
                 <label htmlFor="customer_email" className="mb-1.5 block text-sm font-medium text-slate-700">
                   Customer Email <span className="text-red-500">*</span>
@@ -1324,7 +1425,7 @@ export const PaymentForm = () => {
                       });
                     }
                   }}
-                  className={getInputClass('customerEmail')}
+                  className={getInputClass('customerEmail') + ' bg-white'}
                   placeholder="billing@company.com"
                   autoComplete="email"
                   disabled={isProcessing}
@@ -1332,69 +1433,200 @@ export const PaymentForm = () => {
                 {fieldErrors.customerEmail ? (
                   <p className="mt-1 text-xs text-red-500">{fieldErrors.customerEmail}</p>
                 ) : (
-                  <p className="mt-1 text-xs text-slate-400">For invoice receipt & bank 3DS</p>
+                  <p className="mt-1 text-xs text-slate-400">For invoice receipt & confirmation</p>
                 )}
               </div>
+            </div>
 
-              <div>
-                <label htmlFor="invoice_desc" className="mb-1.5 block text-sm font-medium text-slate-700">
-                  Invoice Memo / Descriptor
-                </label>
-                <input
-                  id="invoice_desc"
-                  type="text"
-                  value={invoiceDescription}
-                  onChange={(e) => setInvoiceDescription(e.target.value)}
-                  className={getInputClass('invoiceDescription')}
-                  placeholder="Service description"
-                  maxLength={60}
-                  disabled={isProcessing}
-                />
-              </div>
+            {/* Invoice Memo */}
+            <div>
+              <label htmlFor="invoice_desc" className="mb-1.5 block text-sm font-medium text-slate-700">
+                Invoice Memo / Descriptor
+              </label>
+              <input
+                id="invoice_desc"
+                type="text"
+                value={invoiceDescription}
+                onChange={(e) => setInvoiceDescription(e.target.value)}
+                className={getInputClass('invoiceDescription') + ' bg-white'}
+                placeholder="Service description"
+                maxLength={60}
+                disabled={isProcessing}
+              />
             </div>
           </div>
 
           {/* ═══════════════════════════════════════════════ */}
-          {/* Section 2: Credit Card Information              */}
+          {/* Step 2: Payment Method & Cardholder Details     */}
           {/* ═══════════════════════════════════════════════ */}
-          <div className="space-y-4 pt-1">
-            <div className="flex items-center gap-2">
-              <div className="h-px flex-1 bg-slate-100" />
-              <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                Card Information
-              </span>
-              <div className="h-px flex-1 bg-slate-100" />
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 space-y-5 shadow-sm">
+            <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-900 text-xs font-bold text-white">
+                  2
+                </span>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-800">
+                    Payment Method & Cardholder Details
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Card & billing address can belong to the customer or a third-party cardholder.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {isApplePayAvailable && (
+              <div>
+                <button
+                  type="button"
+                  onClick={handleApplePay}
+                  disabled={isProcessing}
+                  className="w-full flex items-center justify-center gap-2 rounded-xl bg-black px-4 py-3.5 font-bold text-white shadow-md transition-all hover:bg-slate-900 focus:outline-none focus:ring-4 focus:ring-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <svg viewBox="0 0 40 16" width="40" height="16" fill="currentColor">
+                    <path d="M14.93,7.21c0-1.63,1.33-2.61,2.58-3.23c-0.8-1.17-2.06-1.57-2.91-1.6c-1.24-0.12-2.43,0.73-3.06,0.73c-0.64,0-1.62-0.71-2.65-0.69C7.45,2.44,6.13,3.25,5.34,4.61c-1.6,2.78-0.41,6.89,1.15,9.15c0.76,1.11,1.67,2.33,2.87,2.29c1.17-0.04,1.61-0.75,3.02-0.75c1.4,0,1.81,0.75,3.04,0.73c1.24-0.02,2.02-1.11,2.78-2.22c0.88-1.29,1.24-2.54,1.26-2.61C19.41,11.18,14.93,9.45,14.93,7.21 M11.83,1.6C12.48,0.81,12.91,0,12.8-1.02C11.9,1.06,10.66,1.52,9.97,2.32c-0.6,0.7-1.12,1.59-0.97,2.58C10.02,4.98,11.23,4.41,11.83,1.6 M27.86,4.67v8.9h2.3v-8.9H27.86 M24.3,9.12c0-2.31-1.87-4.18-4.18-4.18c-2.31,0-4.18,1.87-4.18,4.18c0,2.31,1.87,4.18,4.18,4.18C22.43,13.3,24.3,11.43,24.3,9.12 M22.25,9.12c0,1.18-0.95,2.13-2.13,2.13c-1.18,0-2.13-0.95-2.13-2.13c0-1.18,0.95-2.13,2.13-2.13C21.3,6.99,22.25,7.94,22.25,9.12 M39.06,8.74c0-0.79-0.64-1.43-1.43-1.43h-2.92v4.86c0,0.79,0.64,1.43,1.43,1.43c0.79,0,1.43-0.64,1.43-1.43V8.74z M36.14,9.37V6.01h1.49v3.36H36.14z M32.65,11.05V2.32h2.05v8.73H32.65" />
+                  </svg>
+                  Pay with Apple Pay
+                </button>
+                <div className="relative mt-5">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-slate-200"></div>
+                  </div>
+                  <div className="relative flex justify-center text-sm">
+                    <span className="bg-white px-3 text-slate-500 font-medium">Or pay with credit / debit card</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Third-Party Cardholder Toggle */}
+            <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
+              <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={isThirdPartyCard}
+                  onChange={(e) => {
+                    setIsThirdPartyCard(e.target.checked);
+                    if (fieldErrors.cardholderEmail) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.cardholderEmail;
+                        return next;
+                      });
+                    }
+                  }}
+                  disabled={isProcessing}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                />
+                <div className="text-xs sm:text-sm">
+                  <span className="font-semibold text-slate-800">
+                    Paying with someone else&apos;s credit card
+                  </span>
+                  <span className="block text-xs text-slate-500 mt-0.5">
+                    Check this if the cardholder is different from the customer above.
+                  </span>
+                </div>
+              </label>
+
+              {isThirdPartyCard ? (
+                <div className="mt-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  <strong>Third-party card mode:</strong> This card will be processed as a one-time payment and will not be bound to the customer&apos;s profile. Enter the cardholder&apos;s own name and card billing address below.
+                </div>
+              ) : customerName.trim() &&
+                cardholderName.trim() &&
+                customerName.trim().toLowerCase() !== cardholderName.trim().toLowerCase() ? (
+                <div className="mt-2.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
+                  Cardholder name differs from customer name — this transaction will automatically be processed as a one-time third-party card payment.
+                </div>
+              ) : null}
             </div>
 
             {/* Cardholder Name */}
             <div>
-              <label htmlFor="name" className="mb-1.5 block text-sm font-medium text-slate-700">
-                Cardholder Name <span className="text-red-500">*</span>
-              </label>
+              <div className="mb-1.5 flex items-center justify-between gap-2">
+                <label htmlFor="cardholder_name" className="block text-sm font-medium text-slate-700">
+                  Cardholder Name <span className="text-red-500">*</span>
+                </label>
+                {!isThirdPartyCard &&
+                  customerName.trim().length >= 2 &&
+                  cardholderName.trim() !== customerName.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCardholderName(customerName.trim());
+                        if (fieldErrors.cardholderName) {
+                          setFieldErrors((prev) => {
+                            const next = { ...prev };
+                            delete next.cardholderName;
+                            return next;
+                          });
+                        }
+                      }}
+                      disabled={isProcessing}
+                      className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
+                    >
+                      Same as customer
+                    </button>
+                  )}
+              </div>
               <input
-                id="name"
+                id="cardholder_name"
                 type="text"
-                value={name}
+                value={cardholderName}
                 onChange={(e) => {
-                  setName(e.target.value);
-                  if (fieldErrors.name) {
+                  setCardholderName(e.target.value);
+                  if (fieldErrors.cardholderName) {
                     setFieldErrors((prev) => {
                       const next = { ...prev };
-                      delete next.name;
+                      delete next.cardholderName;
                       return next;
                     });
                   }
                 }}
-                className={getInputClass('name')}
+                className={getInputClass('cardholderName')}
                 placeholder="Full name as printed on card"
                 autoComplete="cc-name"
                 maxLength={70}
                 disabled={isProcessing}
               />
-              {fieldErrors.name && (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.name}</p>
+              {fieldErrors.cardholderName && (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderName}</p>
               )}
             </div>
+
+            {/* Cardholder Email (Optional when paying with third-party card) */}
+            {isThirdPartyCard && (
+              <div>
+                <label htmlFor="cardholder_email" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
+                  <span>Cardholder Email</span>
+                  <span className="text-xs font-normal text-slate-400">Optional</span>
+                </label>
+                <input
+                  id="cardholder_email"
+                  type="email"
+                  value={cardholderEmail}
+                  onChange={(e) => {
+                    setCardholderEmail(e.target.value);
+                    if (fieldErrors.cardholderEmail) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.cardholderEmail;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('cardholderEmail')}
+                  placeholder="cardholder@example.com"
+                  disabled={isProcessing}
+                />
+                {fieldErrors.cardholderEmail ? (
+                  <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderEmail}</p>
+                ) : (
+                  <p className="mt-1 text-xs text-slate-400">Optional payer reference (invoice receipt still goes to customer email)</p>
+                )}
+              </div>
+            )}
 
             {/* Card Number */}
             <div>
@@ -1496,40 +1728,36 @@ export const PaymentForm = () => {
                 )}
               </div>
             </div>
-          </div>
 
-          {/* ═══════════════════════════════════════════════ */}
-          {/* Section 3: Billing Address (AVS Standard)       */}
-          {/* ═══════════════════════════════════════════════ */}
-          <div className="space-y-4 pt-1">
-            <div className="flex items-center gap-2">
-              <div className="h-px flex-1 bg-slate-100" />
-              <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                Billing Address (AVS)
-              </span>
-              <div className="h-px flex-1 bg-slate-100" />
-            </div>
+            {/* Cardholder Billing Address (AVS Standard) */}
+            <div className="space-y-4 pt-2 border-t border-slate-100">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  Cardholder Billing Address (AVS)
+                </span>
+                <div className="h-px flex-1 bg-slate-100" />
+              </div>
 
-            {/* AVS Notification Banner */}
-            {countryConfig.isAvsStrict ? (
-              <div className="rounded-xl border border-indigo-100 bg-indigo-50/70 p-3 text-xs text-indigo-900">
-                <div className="flex items-start gap-2">
-                  <span className="text-sm">🛡️</span>
-                  <div>
-                    <span className="font-semibold">AVS Address Verification Required:</span>
-                    <p className="mt-0.5 text-indigo-700">
-                      Cards issued in {countryConfig.name} require your billing address to match your credit card statement exactly (including street number and postal code).
-                    </p>
+              {/* AVS Notification Banner */}
+              {countryConfig.isAvsStrict ? (
+                <div className="rounded-xl border border-indigo-100 bg-indigo-50/70 p-3 text-xs text-indigo-900">
+                  <div className="flex items-start gap-2">
+                    <span className="text-sm">🛡️</span>
+                    <div>
+                      <span className="font-semibold">Cardholder AVS Verification Required:</span>
+                      <p className="mt-0.5 text-indigo-700">
+                        Enter the billing address registered on the <strong>cardholder&apos;s</strong> {countryConfig.name} credit card statement (not the customer&apos;s address if paying with someone else&apos;s card).
+                      </p>
+                    </div>
                   </div>
                 </div>
-              </div>
-            ) : (
-              <div className="rounded-xl border border-slate-100 bg-slate-50 p-2.5 text-xs text-slate-600">
-                <span>
-                  🌍 International Card Acceptance: Enter the billing address associated with this card.
-                </span>
-              </div>
-            )}
+              ) : (
+                <div className="rounded-xl border border-slate-100 bg-slate-50 p-2.5 text-xs text-slate-600">
+                  <span>
+                    🌍 Cardholder Billing Address: Enter the billing address registered with this credit card.
+                  </span>
+                </div>
+              )}
 
             {/* Country Selection */}
             <div>
@@ -1757,6 +1985,7 @@ export const PaymentForm = () => {
                 )}
               </div>
             </div>
+            </div>
           </div>
 
           {/* Top Error Message Banner */}
@@ -1812,7 +2041,7 @@ export const PaymentForm = () => {
               <svg className="h-3.5 w-3.5 text-emerald-500" fill="currentColor" viewBox="0 0 20 20">
                 <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
               </svg>
-              Registered Customer Entity
+              Separated Customer & Cardholder
             </span>
             <span>·</span>
             <span className="inline-flex items-center gap-1">
