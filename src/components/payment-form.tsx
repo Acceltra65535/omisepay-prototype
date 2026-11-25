@@ -125,6 +125,55 @@ function getCardBrand(number: string): string {
   return '';
 }
 
+/**
+ * Standard Luhn mod-10 checksum validation for 13-19 digit PANs.
+ */
+export function isValidLuhn(cardNumber: string): boolean {
+  const digits = cardNumber.replace(/\D/g, '');
+  if (digits.length < 13 || digits.length > 19) return false;
+  let sum = 0;
+  let shouldDouble = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let digit = digits.charCodeAt(i) - 48;
+    if (shouldDouble) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+    shouldDouble = !shouldDouble;
+  }
+  return sum % 10 === 0;
+}
+
+/**
+ * Restrict amount input to digits with at most a single decimal point and 2 fractional digits.
+ */
+export function sanitizeAmountInput(raw: string): string {
+  const cleaned = raw.replace(/[^0-9.]/g, '');
+  if (!cleaned) return '';
+  const dotIdx = cleaned.indexOf('.');
+  if (dotIdx === -1) {
+    return cleaned.replace(/^0+(?=\d)/, '');
+  }
+  const intRaw = cleaned.slice(0, dotIdx);
+  const intNormalized = intRaw === '' ? '0' : intRaw.replace(/^0+(?=\d)/, '');
+  const fracRaw = cleaned.slice(dotIdx + 1).replace(/\./g, '').slice(0, 2);
+  return `${intNormalized}.${fracRaw}`;
+}
+
+/**
+ * Parse a decimal currency string (up to 2 decimal places) into exact integer subunits without float drift.
+ */
+export function parseAmountToSubunits(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) return null;
+  const parts = trimmed.split('.');
+  const intStr = parts[0] ?? '0';
+  const fracStr = (parts[1] ?? '').padEnd(2, '0');
+  const subunits = Number(intStr) * 100 + Number(fracStr);
+  return Number.isSafeInteger(subunits) ? subunits : null;
+}
+
 // Card brands accepted by the Omise Singapore account (verified against Omise Vault:
 // Visa / Mastercard / JCB are tokenized; Amex, Discover, Diners and UnionPay are rejected
 // with "brand not supported"). Contact Omise support to enable more brands, then extend this list.
@@ -621,12 +670,14 @@ export const PaymentForm = () => {
   } => {
     const errors: Record<string, string> = {};
 
-    // 1. Amount validation (1.00 to 20,000.00 in selected currency)
-    const amountNum = parseFloat(amount);
+    // 1. Amount validation (1.00 to 20,000.00 in selected currency, max 2 decimal places)
+    const amountSubunits = parseAmountToSubunits(amount);
     const symbol = currencyConfig.symbol;
-    if (isNaN(amountNum) || amountNum < 1.0) {
+    if (amountSubunits === null) {
+      errors.amount = 'Enter a valid amount with up to 2 decimal places (e.g. 150.00)';
+    } else if (amountSubunits < 100) {
       errors.amount = `Minimum amount is ${symbol}1.00`;
-    } else if (amountNum > 20000.0) {
+    } else if (amountSubunits > 2000000) {
       errors.amount = `Maximum amount is ${symbol}20,000.00`;
     }
 
@@ -671,6 +722,8 @@ export const PaymentForm = () => {
         errors.cardNumber = 'Card number is required';
       } else if (rawCard.length < 13 || rawCard.length > 19) {
         errors.cardNumber = 'Invalid card number (13-19 digits required)';
+      } else if (!isValidLuhn(rawCard)) {
+        errors.cardNumber = 'Invalid card number — please check for typos (Luhn check failed)';
       } else if (!(ACCEPTED_CARD_BRANDS as readonly string[]).includes(cardBrand)) {
         errors.cardNumber = `This card type is not supported. Please use a ${ACCEPTED_BRANDS_LABEL} card.`;
       } else if (!isCardBrandSupportedForCurrency(cardBrand, currency)) {
@@ -739,7 +792,6 @@ export const PaymentForm = () => {
       invoiceNumber,
       cardholderName,
       cardholderEmail,
-      isThirdPartyCard,
       cardholderPhone,
       showCardholderEmailField,
       cardNumber,
@@ -760,12 +812,16 @@ export const PaymentForm = () => {
 
   const handleApplePay = async () => {
     setError('');
-    const amt = parseFloat(amount);
-    if (isNaN(amt) || amt < 1.0) {
+    const amountInCents = parseAmountToSubunits(amount);
+    if (amountInCents === null) {
+      setError('Please enter a valid amount with up to 2 decimal places before using Apple Pay.');
+      return;
+    }
+    if (amountInCents < 100) {
       setError(`Please enter a valid amount (Minimum ${currencyConfig.symbol}1.00) before using Apple Pay.`);
       return;
     }
-    if (amt > 20000.0) {
+    if (amountInCents > 2000000) {
       setError(`Amount exceeds maximum (${currencyConfig.symbol}20,000.00) for Apple Pay.`);
       return;
     }
@@ -791,7 +847,7 @@ export const PaymentForm = () => {
         // Omise Multi-currency only accepts Visa / Mastercard, so JCB is offered for SGD only.
         supportedNetworks: [...currencyConfig.applePayNetworks],
         merchantCapabilities: ['supports3DS', 'supportsCredit', 'supportsDebit'],
-        total: { label: 'Omise Pay', amount: amt.toFixed(2) },
+        total: { label: 'Omise Pay', amount: (amountInCents / 100).toFixed(2) },
       };
 
       try {
@@ -866,7 +922,6 @@ export const PaymentForm = () => {
             });
 
             setStatus('charging');
-            const amountInCents = Math.round(amt * 100);
             const clientRef = 'om_ref_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
             const returnUri = window.location.origin + window.location.pathname + '?ref=' + clientRef;
             const applePayNetwork = String(event.payment.token.paymentMethod?.network || '').toLowerCase();
@@ -1051,7 +1106,10 @@ export const PaymentForm = () => {
 
         // Step 2: Create Customer Entity (when own card) and Charge with separated Customer & Payer info
         setStatus('charging');
-        const amountInCents = Math.round(parseFloat(amount) * 100);
+        const amountInCents = parseAmountToSubunits(amount);
+        if (amountInCents === null) {
+          throw new Error('Enter a valid payment amount with up to 2 decimal places.');
+        }
 
         const clientRef =
           'om_ref_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
@@ -1687,7 +1745,7 @@ return (
                 inputMode="decimal"
                 value={amount}
                 onChange={(e) => {
-                  setAmount(e.target.value.replace(/[^0-9.]/g, ''));
+                  setAmount(sanitizeAmountInput(e.target.value));
                   if (fieldErrors.amount) {
                     setFieldErrors((prev) => {
                       const next = { ...prev };

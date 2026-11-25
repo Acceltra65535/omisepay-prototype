@@ -1123,7 +1123,13 @@ const chargeApi = (): MiddlewareHandler => {
         const currencyConfig = SUPPORTED_CURRENCIES[finalCurrency] || SUPPORTED_CURRENCIES.sgd;
         const currencySymbol = currencyConfig.symbol;
 
-        if (!amount || typeof amount !== 'number' || amount < OMISE_CONFIG.minAmountSubunits) {
+        if (typeof amount !== 'number' || !Number.isSafeInteger(amount)) {
+          return c.json(
+            { error: 'Invalid amount: must be an integer number of subunits (cents)' },
+            400,
+          );
+        }
+        if (amount < OMISE_CONFIG.minAmountSubunits) {
           return c.json(
             { error: `Invalid amount: minimum is ${currencySymbol}1.00 (100 subunits)` },
             400,

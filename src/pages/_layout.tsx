@@ -31,7 +31,8 @@ export default async function RootLayout({ children }: RootLayoutProps) {
 
 const getData = async () => {
   const data = {
-    description: 'An internet website!',
+    description:
+      'OmisePay SG — Secure multi-currency credit card and Apple Pay checkout portal supporting SGD, USD, and CAD with mandatory 3D Secure 2.0.',
     icon: '/images/favicon.png',
   };
 
