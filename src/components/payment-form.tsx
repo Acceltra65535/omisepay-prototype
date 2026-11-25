@@ -26,6 +26,7 @@ type PaymentStatus =
   | 'charging'
   | 'awaiting_3ds'
   | 'verifying'
+  | 'pending'
   | 'success'
   | 'failed';
 
@@ -227,6 +228,25 @@ export function buildCurrencyReference(
   };
 }
 
+export function getAuthenticationBadge(
+  result: Pick<ChargeResult, 'authenticated_by' | 'payment_method'>,
+): { label: string; tone: 'emerald' | 'amber' } {
+  const authUpper = (result.authenticated_by || '').toUpperCase();
+  if (authUpper === '3DS') {
+    return { label: '✓ 3D Secure 2.0 (3DS)', tone: 'emerald' };
+  }
+  if (authUpper === 'PASSKEY') {
+    return { label: '✓ Passkey (3DS2)', tone: 'emerald' };
+  }
+  if (result.authenticated_by) {
+    return { label: `✓ ${result.authenticated_by}`, tone: 'emerald' };
+  }
+  if (result.payment_method === 'apple_pay') {
+    return { label: '✓ Apple Pay (Device Biometric)', tone: 'emerald' };
+  }
+  return { label: '⚠ Not 3DS Authenticated', tone: 'amber' };
+}
+
 export const LAST_CHARGE_STORAGE_KEY = 'omise_last_charge_id';
 
 function getStoredLastChargeId(): string | null {
@@ -353,6 +373,7 @@ export const PaymentForm = () => {
   const applePayMerchantIdRef = useRef('');
   const verifyRunIdRef = useRef(0);
   const verifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastVerifyEndpointRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (typeof window !== 'undefined' && (window as any).ApplePaySession) {
@@ -486,6 +507,7 @@ export const PaymentForm = () => {
   }, []);
 
   async function verifyCharge(endpoint: string, attempt = 1, runId?: number) {
+    lastVerifyEndpointRef.current = endpoint;
     let activeRunId = runId;
     if (activeRunId === undefined) {
       verifyRunIdRef.current += 1;
@@ -531,10 +553,8 @@ export const PaymentForm = () => {
             2000,
           );
         } else {
-          setError(
-            'Payment is currently processing. Please check your bank statement or contact support.',
-          );
-          setStatus('failed');
+          setError('');
+          setStatus('pending');
           clearStoredLastChargeId();
         }
       } else {
@@ -1089,6 +1109,11 @@ export const PaymentForm = () => {
           clearStoredLastChargeId();
           setChargeResult(chargeData);
           setStatus('success');
+        } else if (chargeData.status === 'pending') {
+          saveStoredLastChargeId(chargeData.id);
+          setChargeResult(chargeData);
+          setStatus('verifying');
+          verifyCharge(`/api/charge/${chargeData.id}`);
         } else if (chargeData.status === 'failed' || chargeData.status === 'reversed') {
           clearStoredLastChargeId();
           throw new Error(
@@ -1138,6 +1163,7 @@ export const PaymentForm = () => {
       clearTimeout(verifyTimerRef.current);
       verifyTimerRef.current = null;
     }
+    lastVerifyEndpointRef.current = null;
     clearStoredLastChargeId();
     if (typeof window !== 'undefined' && window.location.search) {
       const params = new URLSearchParams(window.location.search);
@@ -1166,6 +1192,16 @@ export const PaymentForm = () => {
     setError('');
     setFieldErrors({});
     setChargeResult(null);
+  };
+
+  const handleRefreshPendingStatus = () => {
+    const endpoint =
+      lastVerifyEndpointRef.current ||
+      (chargeResult?.id ? `/api/charge/${chargeResult.id}` : null);
+    if (!endpoint) return;
+    setError('');
+    setStatus('verifying');
+    verifyCharge(endpoint);
   };
 
 const isProcessing = status === 'tokenizing' || status === 'charging';
@@ -1220,6 +1256,78 @@ if (status === 'awaiting_3ds') {
         </p>
         <p className="mt-3 text-xs text-slate-500">
           Please do not close or refresh this window.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Render: Pending Bank Confirmation (after polling timeout) ─
+
+if (status === 'pending') {
+  const pendingCurrRaw = (chargeResult?.currency || currency).toLowerCase();
+  const pendingCurr: SupportedCurrency = isSupportedCurrency(pendingCurrRaw) ? pendingCurrRaw : 'sgd';
+  const pendingCfg = SUPPORTED_CURRENCIES[pendingCurr] || SUPPORTED_CURRENCIES.sgd;
+  return (
+    <div className="mx-auto w-full max-w-xl">
+      <div className="rounded-2xl border border-amber-200 bg-gradient-to-br from-amber-50 via-white to-indigo-50/40 p-6 sm:p-8 text-center shadow-xl">
+        <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-amber-100 text-amber-700">
+          <svg className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        </div>
+        <h3 className="mb-2 text-xl font-bold text-slate-900">
+          Payment Processing — Do Not Pay Again
+        </h3>
+        <p className="mb-5 text-sm text-slate-600 leading-relaxed">
+          Your card issuer bank is still finalizing 3D Secure 2.0 confirmation. Please wait a moment and click below to refresh status rather than submitting a second payment.
+        </p>
+        {chargeResult && (
+          <div className="mb-6 space-y-2 rounded-xl border border-amber-200/80 bg-white/80 p-4 text-left text-xs sm:text-sm">
+            <div className="flex justify-between py-1 border-b border-slate-100">
+              <span className="text-slate-500">Invoice Reference</span>
+              <span className="font-mono font-medium text-slate-800">
+                {chargeResult.invoice_number || invoiceNumber}
+              </span>
+            </div>
+            <div className="flex justify-between py-1 border-b border-slate-100">
+              <span className="text-slate-500">Transaction ID</span>
+              <span className="font-mono text-xs text-slate-700">
+                {chargeResult.id}
+              </span>
+            </div>
+            <div className="flex justify-between py-1 border-b border-slate-100">
+              <span className="text-slate-500">Amount</span>
+              <span className="font-semibold text-slate-900">
+                {pendingCfg.symbol}{(chargeResult.amount / 100).toFixed(2)} {pendingCfg.code.toUpperCase()}
+              </span>
+            </div>
+            <div className="flex justify-between items-center py-1">
+              <span className="text-slate-500">Status</span>
+              <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
+                Pending Bank Confirmation
+              </span>
+            </div>
+          </div>
+        )}
+        <div className="flex flex-col sm:flex-row gap-3">
+          <button
+            type="button"
+            onClick={handleRefreshPendingStatus}
+            className="flex-1 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-md transition-all hover:bg-indigo-700 active:scale-[0.98]"
+          >
+            Refresh Payment Status
+          </button>
+          <button
+            type="button"
+            onClick={handleReset}
+            className="flex-1 rounded-xl border border-slate-200 bg-white px-5 py-3 text-sm font-medium text-slate-700 transition-all hover:bg-slate-50 active:scale-[0.98]"
+          >
+            Start a New Payment
+          </button>
+        </div>
+        <p className="mt-3 text-xs text-slate-500">
+          Only start a new payment if you have confirmed with your bank that this charge was cancelled.
         </p>
       </div>
     </div>
@@ -1342,42 +1450,17 @@ if (status === 'success' && chargeResult) {
           </div>
           <div className="flex justify-between py-1 border-b border-slate-100">
             <span className="text-slate-500">Authentication</span>
-            <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
-              ✓ {chargeResult.authenticated_by ? chargeResult.authenticated_by : '3D Secure 2.0 Verified'}
-            </span>
             {(() => {
-              const authUpper = (chargeResult.authenticated_by || '').toUpperCase();
-              if (authUpper === '3DS') {
-                return (
-                  <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
-                    ✓ 3D Secure 2.0 (3DS)
-                  </span>
-                );
-              }
-              if (authUpper === 'PASSKEY') {
-                return (
-                  <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
-                    ✓ Passkey (3DS2)
-                  </span>
-                );
-              }
-              if (chargeResult.authenticated_by) {
-                return (
-                  <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
-                    ✓ {chargeResult.authenticated_by}
-                  </span>
-                );
-              }
-              if (chargeResult.payment_method === 'apple_pay') {
-                return (
-                  <span className="inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
-                    ✓ Apple Pay (Device Biometric)
-                  </span>
-                );
-              }
+              const badge = getAuthenticationBadge(chargeResult);
               return (
-                <span className="inline-flex items-center gap-1 rounded bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-800">
-                  ⚠ Not 3DS Authenticated
+                <span
+                  className={
+                    badge.tone === 'emerald'
+                      ? 'inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700'
+                      : 'inline-flex items-center gap-1 rounded bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-800'
+                  }
+                >
+                  {badge.label}
                 </span>
               );
             })()}
