@@ -24,6 +24,8 @@ import {
   type StoredChargeEntry,
 } from '../utils/charge-store';
 import { getExchangeRates } from '../utils/fx-rates';
+import { getCountryByCode } from '../config/countries';
+import { validateAvsAddress } from '../utils/avs';
 
 /**
  * Helper to dynamically load keys from .env if process.env hasn't loaded them
@@ -1199,6 +1201,28 @@ const chargeApi = (): MiddlewareHandler => {
         const cardholderName = payer?.cardholder_name ? String(payer.cardholder_name).trim() : '';
         const cardholderEmail = payer?.cardholder_email ? String(payer.cardholder_email).trim() : '';
         const cardholderPhone = payer?.cardholder_phone ? String(payer.cardholder_phone).trim() : '';
+        const payerAddress = payer?.address;
+        const normalizedPayerAddress = payerAddress && typeof payerAddress === 'object'
+          ? {
+            country: typeof payerAddress.country === 'string' ? payerAddress.country.trim().toUpperCase() : '',
+            street1: typeof payerAddress.street1 === 'string' ? payerAddress.street1.trim() : '',
+            street2: typeof payerAddress.street2 === 'string' ? payerAddress.street2.trim() : '',
+            city: typeof payerAddress.city === 'string' ? payerAddress.city.trim() : '',
+            state: typeof payerAddress.state === 'string' ? payerAddress.state.trim() : '',
+            postalCode: typeof payerAddress.postal_code === 'string' ? payerAddress.postal_code.trim() : '',
+          }
+          : null;
+
+        if (!is_apple_pay) {
+          if (!normalizedPayerAddress) {
+            return c.json({ error: 'Payer address is required' }, 400);
+          }
+          const payerAddressConfig = getCountryByCode(normalizedPayerAddress.country);
+          const payerAddressValidation = validateAvsAddress(normalizedPayerAddress, payerAddressConfig);
+          if (!payerAddressValidation.isValid) {
+            return c.json({ error: payerAddressValidation.firstError || 'Invalid payer address' }, 400);
+          }
+        }
 
         if (cardholderEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cardholderEmail)) {
           return c.json({ error: 'Invalid cardholder email address' }, 400);
@@ -1275,6 +1299,12 @@ const chargeApi = (): MiddlewareHandler => {
             cardholder_email: cardholderEmail,
             cardholder_phone: cardholderPhone,
             is_third_party_card: isThirdPartyCard,
+            payer_address_country: normalizedPayerAddress?.country || '',
+            payer_address_street1: normalizedPayerAddress?.street1 || '',
+            payer_address_street2: normalizedPayerAddress?.street2 || '',
+            payer_address_city: normalizedPayerAddress?.city || '',
+            payer_address_state: normalizedPayerAddress?.state || '',
+            payer_address_postal_code: normalizedPayerAddress?.postalCode || '',
             charge_currency: finalCurrency.toUpperCase(),
             payment_method: is_apple_pay ? 'apple_pay' : 'card',
             three_ds_required: OMISE_CONFIG.threeDS.required,

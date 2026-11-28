@@ -376,6 +376,95 @@ export function generateOrderNumber(): string {
   return `CBJ${Date.now()}${chars.join('')}`;
 }
 
+type AddressField = 'country' | 'street1' | 'street2' | 'city' | 'state' | 'postalCode';
+
+function AddressFields({
+  idPrefix,
+  title,
+  value,
+  config,
+  errors,
+  disabled,
+  onChange,
+}: {
+  idPrefix: string;
+  title: string;
+  value: {
+    country: string;
+    street1: string;
+    street2: string;
+    city: string;
+    state: string;
+    postalCode: string;
+  };
+  config: CountryConfig;
+  errors: Record<string, string>;
+  disabled: boolean;
+  onChange: (field: AddressField, value: string) => void;
+}) {
+  const inputClass = (field: AddressField) =>
+    `w-full rounded-lg border px-3 py-2.5 text-sm outline-none ${errors[field] ? 'border-red-400 bg-red-50' : 'border-slate-200 bg-white'} focus:border-indigo-400`;
+
+  const selectCountry = (newCountry: string) => {
+    onChange('country', newCountry);
+    onChange('state', '');
+    onChange('postalCode', '');
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">{title}</span>
+        <div className="h-px flex-1 bg-slate-100" />
+      </div>
+      <div>
+        <label htmlFor={`${idPrefix}-country`} className="mb-1.5 block text-sm font-medium text-slate-700">
+          Country / Region <span className="text-red-500">*</span>
+        </label>
+        <select id={`${idPrefix}-country`} value={value.country} onChange={(e) => selectCountry(e.target.value)} className={inputClass('country')} disabled={disabled} autoComplete="country">
+          <optgroup label="Popular Countries & Regions">
+            {POPULAR_COUNTRIES.map((c) => <option key={`payer-pop-${c.code}`} value={c.code}>{c.name} ({c.code})</option>)}
+          </optgroup>
+          <optgroup label="All Countries & Regions (A-Z)">
+            {SORTED_ALL_COUNTRIES.map((c) => <option key={`payer-all-${c.code}`} value={c.code}>{c.name} ({c.code})</option>)}
+          </optgroup>
+        </select>
+        {errors.country && <p className="mt-1 text-xs text-red-500">{errors.country}</p>}
+      </div>
+      <div>
+        <label htmlFor={`${idPrefix}-street1`} className="mb-1.5 block text-sm font-medium text-slate-700">Street Address (Line 1) <span className="text-red-500">*</span></label>
+        <input id={`${idPrefix}-street1`} value={value.street1} onChange={(e) => onChange('street1', e.target.value)} className={inputClass('street1')} placeholder="Building / house number and street" autoComplete="address-line1" maxLength={50} disabled={disabled} />
+        {errors.street1 && <p className="mt-1 text-xs text-red-500">{errors.street1}</p>}
+      </div>
+      <div>
+        <label htmlFor={`${idPrefix}-street2`} className="mb-1.5 block text-sm font-medium text-slate-700">Address Line 2 <span className="text-xs font-normal text-slate-400">Optional</span></label>
+        <input id={`${idPrefix}-street2`} value={value.street2} onChange={(e) => onChange('street2', e.target.value)} className={inputClass('street2')} placeholder="Apt, suite, unit or floor" autoComplete="address-line2" maxLength={50} disabled={disabled} />
+        {errors.street2 && <p className="mt-1 text-xs text-red-500">{errors.street2}</p>}
+      </div>
+      <div>
+        <label htmlFor={`${idPrefix}-city`} className="mb-1.5 block text-sm font-medium text-slate-700">City / Town <span className="text-red-500">*</span></label>
+        <input id={`${idPrefix}-city`} value={value.city} onChange={(e) => onChange('city', e.target.value)} className={inputClass('city')} placeholder="City name" autoComplete="address-level2" maxLength={50} disabled={disabled} />
+        {errors.city && <p className="mt-1 text-xs text-red-500">{errors.city}</p>}
+      </div>
+      <div className={`grid gap-4 ${config.hasStates ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'}`}>
+        {config.hasStates && <div>
+          <label htmlFor={`${idPrefix}-state`} className="mb-1.5 block text-sm font-medium text-slate-700">{config.stateLabel} <span className="text-red-500">*</span></label>
+          {config.states?.length ? <select id={`${idPrefix}-state`} value={value.state} onChange={(e) => onChange('state', e.target.value)} className={inputClass('state')} disabled={disabled} autoComplete="address-level1">
+            <option value="">Select {config.stateLabel}…</option>
+            {config.states.map((item) => <option key={item.code} value={item.code}>{item.code} – {item.name}</option>)}
+          </select> : <input id={`${idPrefix}-state`} value={value.state} onChange={(e) => onChange('state', e.target.value)} className={inputClass('state')} placeholder={config.stateLabel} autoComplete="address-level1" maxLength={50} disabled={disabled} />}
+          {errors.state && <p className="mt-1 text-xs text-red-500">{errors.state}</p>}
+        </div>}
+        <div>
+          <label htmlFor={`${idPrefix}-postal`} className="mb-1.5 block text-sm font-medium text-slate-700">{config.postalLabel} {config.postalRequired && <span className="text-red-500">*</span>}</label>
+          <input id={`${idPrefix}-postal`} value={value.postalCode} onChange={(e) => onChange('postalCode', e.target.value)} onBlur={() => value.postalCode && onChange('postalCode', formatPostalCode(value.country, value.postalCode))} className={inputClass('postalCode')} placeholder={config.postalPlaceholder} autoComplete="postal-code" maxLength={16} disabled={disabled} />
+          {errors.postalCode && <p className="mt-1 text-xs text-red-500">{errors.postalCode}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Main Payment Form Component ─────────────────────────────
 
 export const PaymentForm = () => {
@@ -407,6 +496,9 @@ export const PaymentForm = () => {
   const [city, setCity] = useState('');
   const [state, setState] = useState('');
   const [postalCode, setPostalCode] = useState('');
+  const [payerAddress, setPayerAddress] = useState({
+    country: 'US', street1: '', street2: '', city: '', state: '', postalCode: '',
+  });
 
   // UI state & validation
   const [status, setStatus] = useState<PaymentStatus>('idle');
@@ -442,6 +534,7 @@ export const PaymentForm = () => {
   const countryConfig: CountryConfig = useMemo(() => {
     return getCountryByCode(country);
   }, [country]);
+  const payerCountryConfig = useMemo(() => getCountryByCode(payerAddress.country), [payerAddress.country]);
 
   // Detected card brand
   const cardBrand = useMemo(() => getCardBrand(cardNumber), [cardNumber]);
@@ -661,6 +754,18 @@ export const PaymentForm = () => {
     }
   };
 
+  const handlePayerAddressChange = (field: AddressField, value: string) => {
+    setPayerAddress((current) => ({ ...current, [field]: value }));
+    const errorKey = `payerAddress.${field}`;
+    if (fieldErrors[errorKey]) {
+      setFieldErrors((current) => {
+        const next = { ...current };
+        delete next[errorKey];
+        return next;
+      });
+    }
+  };
+
   // ── Comprehensive Form, Invoicing & AVS Validation ────────
 
   const validateForm = useCallback((): {
@@ -778,6 +883,23 @@ export const PaymentForm = () => {
         Object.assign(errors, avsResult.errors);
       }
 
+      const payerAddressResult = validateAvsAddress(
+        {
+          country: payerAddress.country,
+          street1: payerAddress.street1,
+          street2: payerAddress.street2,
+          city: payerAddress.city,
+          state: payerAddress.state,
+          postalCode: payerAddress.postalCode,
+        },
+        payerCountryConfig,
+      );
+      if (!payerAddressResult.isValid) {
+        for (const [field, message] of Object.entries(payerAddressResult.errors)) {
+          errors[`payerAddress.${field}`] = message;
+        }
+      }
+
       const errorKeys = Object.keys(errors);
       const valid = errorKeys.length === 0;
       const mainError = valid ? undefined : errors[errorKeys[0]!];
@@ -806,6 +928,8 @@ export const PaymentForm = () => {
       countryConfig,
       currency,
       currencyConfig,
+      payerAddress,
+      payerCountryConfig,
     ]);
 
   // ── Apple Pay Flow ─────────────────────────────────────────
@@ -1138,6 +1262,14 @@ export const PaymentForm = () => {
                   : undefined,
               cardholder_phone: normalizedPhone || undefined,
               is_third_party_card: effectiveThirdParty,
+              address: {
+                country: payerAddress.country,
+                street1: payerAddress.street1.trim(),
+                street2: payerAddress.street2.trim() || undefined,
+                city: payerAddress.city.trim(),
+                state: payerAddress.state.trim() || undefined,
+                postal_code: payerAddress.postalCode.trim() || undefined,
+              },
             },
             invoice: {
               invoice_number: invoiceNumber.trim(),
@@ -1864,7 +1996,7 @@ return (
                   Payment Method & Cardholder Details
                 </h3>
                 <p className="text-xs text-slate-500">
-                  Card & billing address can belong to the customer or a third-party cardholder.
+                  Cardholder details, payer address, and card billing address are collected separately.
                 </p>
               </div>
             </div>
@@ -2416,6 +2548,25 @@ return (
                 )}
               </div>
             </div>
+          </div>
+
+          <div className="rounded-xl border border-slate-100 bg-slate-50/60 p-4">
+            <p className="mb-3 text-xs text-slate-600">
+              Enter the payer&apos;s own address. This is stored separately from the card billing address used for AVS.
+            </p>
+            <AddressFields
+              idPrefix="payer-address"
+              title="Payer Address"
+              value={payerAddress}
+              config={payerCountryConfig}
+              errors={Object.fromEntries(
+                Object.entries(fieldErrors)
+                  .filter(([key]) => key.startsWith('payerAddress.'))
+                  .map(([key, message]) => [key.slice('payerAddress.'.length), message]),
+              )}
+              disabled={isProcessing}
+              onChange={handlePayerAddressChange}
+            />
           </div>
         </div>
 
