@@ -496,7 +496,7 @@ export const PaymentForm = () => {
   const [city, setCity] = useState('');
   const [state, setState] = useState('');
   const [postalCode, setPostalCode] = useState('');
-  const [payerAddress, setPayerAddress] = useState({
+  const [customerAddress, setCustomerAddress] = useState({
     country: 'US', street1: '', street2: '', city: '', state: '', postalCode: '',
   });
 
@@ -534,7 +534,10 @@ export const PaymentForm = () => {
   const countryConfig: CountryConfig = useMemo(() => {
     return getCountryByCode(country);
   }, [country]);
-  const payerCountryConfig = useMemo(() => getCountryByCode(payerAddress.country), [payerAddress.country]);
+  const customerAddressCountryConfig = useMemo(
+    () => getCountryByCode(customerAddress.country),
+    [customerAddress.country],
+  );
 
   // Detected card brand
   const cardBrand = useMemo(() => getCardBrand(cardNumber), [cardNumber]);
@@ -754,9 +757,9 @@ export const PaymentForm = () => {
     }
   };
 
-  const handlePayerAddressChange = (field: AddressField, value: string) => {
-    setPayerAddress((current) => ({ ...current, [field]: value }));
-    const errorKey = `payerAddress.${field}`;
+  const handleCustomerAddressChange = (field: AddressField, value: string) => {
+    setCustomerAddress((current) => ({ ...current, [field]: value }));
+    const errorKey = `customerAddress.${field}`;
     if (fieldErrors[errorKey]) {
       setFieldErrors((current) => {
         const next = { ...current };
@@ -883,20 +886,20 @@ export const PaymentForm = () => {
         Object.assign(errors, avsResult.errors);
       }
 
-      const payerAddressResult = validateAvsAddress(
+      const customerAddressResult = validateAvsAddress(
         {
-          country: payerAddress.country,
-          street1: payerAddress.street1,
-          street2: payerAddress.street2,
-          city: payerAddress.city,
-          state: payerAddress.state,
-          postalCode: payerAddress.postalCode,
+          country: customerAddress.country,
+          street1: customerAddress.street1,
+          street2: customerAddress.street2,
+          city: customerAddress.city,
+          state: customerAddress.state,
+          postalCode: customerAddress.postalCode,
         },
-        payerCountryConfig,
+        customerAddressCountryConfig,
       );
-      if (!payerAddressResult.isValid) {
-        for (const [field, message] of Object.entries(payerAddressResult.errors)) {
-          errors[`payerAddress.${field}`] = message;
+      if (!customerAddressResult.isValid) {
+        for (const [field, message] of Object.entries(customerAddressResult.errors)) {
+          errors[`customerAddress.${field}`] = message;
         }
       }
 
@@ -928,8 +931,8 @@ export const PaymentForm = () => {
       countryConfig,
       currency,
       currencyConfig,
-      payerAddress,
-      payerCountryConfig,
+      customerAddress,
+      customerAddressCountryConfig,
     ]);
 
   // ── Apple Pay Flow ─────────────────────────────────────────
@@ -960,6 +963,13 @@ export const PaymentForm = () => {
       const normalizedApplePayPhone = cardholderPhone.trim()
         ? normalizeInternationalPhone(cardholderPhone)
         : '';
+    const hasCustomerAddress = [
+      customerAddress.street1,
+      customerAddress.street2,
+      customerAddress.city,
+      customerAddress.state,
+      customerAddress.postalCode,
+    ].some((value) => value.trim());
       if (normalizedApplePayPhone && !/^\+[1-9]\d{6,14}$/.test(normalizedApplePayPhone)) {
         setError(`Please enter a valid international cardholder phone number starting with + (e.g. ${getCountryDialCode(country)} 8123 4567).`);
         return;
@@ -1062,10 +1072,20 @@ export const PaymentForm = () => {
                 is_apple_pay: true,
                 card_brand: applePayNetwork || undefined,
                 customer:
-                  customerName.trim() || customerEmail.trim()
+                  customerName.trim() || customerEmail.trim() || hasCustomerAddress
                     ? {
                       name: customerName.trim() || undefined,
                       email: customerEmail.trim() || undefined,
+                      address: hasCustomerAddress
+                        ? {
+                          country: customerAddress.country,
+                          street1: customerAddress.street1.trim(),
+                          street2: customerAddress.street2.trim() || undefined,
+                          city: customerAddress.city.trim(),
+                          state: customerAddress.state.trim() || undefined,
+                          postal_code: customerAddress.postalCode.trim() || undefined,
+                        }
+                        : undefined,
                     }
                     : undefined,
                 payer: {
@@ -1253,6 +1273,14 @@ export const PaymentForm = () => {
             customer: {
               name: customerName.trim(),
               email: customerEmail.trim(),
+              address: {
+                country: customerAddress.country,
+                street1: customerAddress.street1.trim(),
+                street2: customerAddress.street2.trim() || undefined,
+                city: customerAddress.city.trim(),
+                state: customerAddress.state.trim() || undefined,
+                postal_code: customerAddress.postalCode.trim() || undefined,
+              },
             },
             payer: {
               cardholder_name: cardholderName.trim(),
@@ -1262,14 +1290,6 @@ export const PaymentForm = () => {
                   : undefined,
               cardholder_phone: normalizedPhone || undefined,
               is_third_party_card: effectiveThirdParty,
-              address: {
-                country: payerAddress.country,
-                street1: payerAddress.street1.trim(),
-                street2: payerAddress.street2.trim() || undefined,
-                city: payerAddress.city.trim(),
-                state: payerAddress.state.trim() || undefined,
-                postal_code: payerAddress.postalCode.trim() || undefined,
-              },
             },
             invoice: {
               invoice_number: invoiceNumber.trim(),
@@ -1964,7 +1984,23 @@ return (
             </div>
           </div>
 
-          {/* Invoice Memo */}
+          <div className="border-t border-indigo-100 pt-4">
+            <AddressFields
+              idPrefix="customer-address"
+              title="Customer Address"
+              value={customerAddress}
+              config={customerAddressCountryConfig}
+              errors={Object.fromEntries(
+                Object.entries(fieldErrors)
+                  .filter(([key]) => key.startsWith('customerAddress.'))
+                  .map(([key, message]) => [key.slice('customerAddress.'.length), message]),
+              )}
+              disabled={isProcessing}
+              onChange={handleCustomerAddressChange}
+            />
+          </div>
+
+          {/* Order details */}
           <div>
             <label htmlFor="invoice_desc" className="mb-1.5 block text-sm font-medium text-slate-700">
               Invoice Memo / Descriptor
@@ -2026,120 +2062,20 @@ return (
             </div>
           )}
 
-          <section aria-labelledby="payer-details-heading" className="rounded-xl border border-indigo-100 bg-indigo-50/30 p-4 space-y-4">
+          <section aria-labelledby="cardholder-details-heading" className="rounded-xl border border-slate-200 bg-slate-50/50 p-4 space-y-4">
             <div>
-              <h4 id="payer-details-heading" className="text-sm font-semibold text-slate-800">Payer details</h4>
-              <p className="mt-0.5 text-xs text-slate-500">These details identify the person making the payment.</p>
+              <h4 id="cardholder-details-heading" className="text-sm font-semibold text-slate-800">Cardholder details</h4>
+              <p className="mt-0.5 text-xs text-slate-500">Enter the name and contact details associated with the payment card.</p>
             </div>
 
-          {/* Third-Party Cardholder Toggle */}
-          <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
-            <label className="flex items-start gap-2.5 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={isThirdPartyCard}
-                onChange={(e) => {
-                  setIsThirdPartyCard(e.target.checked);
-                  if (fieldErrors.cardholderEmail) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.cardholderEmail;
-                      return next;
-                    });
-                  }
-                }}
-                disabled={isProcessing}
-                className="mt-0.5 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-              />
-              <div className="text-xs sm:text-sm">
-                <span className="font-semibold text-slate-800">
-                  Paying with someone else&apos;s credit card
-                </span>
-                <span className="block text-xs text-slate-500 mt-0.5">
-                  Check this if the cardholder is different from the customer above.
-                </span>
-              </div>
-            </label>
-
-            {isThirdPartyCard ? (
-              <div className="mt-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                <strong>Third-party card mode:</strong> This card will be processed as a one-time payment and will not be bound to the customer&apos;s profile. Enter the cardholder&apos;s own name and card billing address below.
-              </div>
-            ) : customerName.trim() &&
-              cardholderName.trim() &&
-              customerName.trim().toLowerCase() !== cardholderName.trim().toLowerCase() ? (
-              <div className="mt-2.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
-                Cardholder name differs from customer name — this transaction will automatically be processed as a one-time third-party card payment.
-              </div>
-            ) : null}
-          </div>
-
-          {/* Cardholder Name */}
-          <div>
-            <div className="mb-1.5 flex items-center justify-between gap-2">
-              <label htmlFor="cardholder_name" className="block text-sm font-medium text-slate-700">
-                Cardholder Name <span className="text-red-500">*</span>
-              </label>
-              {!isThirdPartyCard &&
-                customerName.trim().length >= 2 &&
-                cardholderName.trim() !== customerName.trim() && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setCardholderName(customerName.trim());
-                      if (fieldErrors.cardholderName) {
-                        setFieldErrors((prev) => {
-                          const next = { ...prev };
-                          delete next.cardholderName;
-                          return next;
-                        });
-                      }
-                    }}
-                    disabled={isProcessing}
-                    className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
-                  >
-                    Same as customer
-                  </button>
-                )}
-            </div>
-            <input
-              id="cardholder_name"
-              type="text"
-              value={cardholderName}
-              onChange={(e) => {
-                setCardholderName(e.target.value);
-                if (fieldErrors.cardholderName) {
-                  setFieldErrors((prev) => {
-                    const next = { ...prev };
-                    delete next.cardholderName;
-                    return next;
-                  });
-                }
-              }}
-              className={getInputClass('cardholderName')}
-              placeholder="Full name as printed on card"
-              autoComplete="cc-name"
-              maxLength={70}
-              disabled={isProcessing}
-            />
-            {fieldErrors.cardholderName && (
-              <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderName}</p>
-            )}
-          </div>
-
-            {/* Cardholder Email (shown when paying with third-party card or cardholder name differs) */}
-            {showCardholderEmailField && (
-              <div>
-                <label htmlFor="cardholder_email" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
-                  <span>Cardholder Email</span>
-                  <span className="text-xs font-normal text-slate-400">Optional · 3DS 2.0</span>
-                </label>
+            {/* Third-Party Cardholder Toggle */}
+            <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
+              <label className="flex items-start gap-2.5 cursor-pointer select-none">
                 <input
-                  id="cardholder_email"
-                  type="email"
-                  value={cardholderEmail}
+                  type="checkbox"
+                  checked={isThirdPartyCard}
                   onChange={(e) => {
-                    setCardholderEmail(e.target.value);
+                    setIsThirdPartyCard(e.target.checked);
                     if (fieldErrors.cardholderEmail) {
                       setFieldErrors((prev) => {
                         const next = { ...prev };
@@ -2148,70 +2084,155 @@ return (
                       });
                     }
                   }}
-                  className={getInputClass('cardholderEmail')}
-                  placeholder="cardholder@example.com"
                   disabled={isProcessing}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
                 />
-                {fieldErrors.cardholderEmail ? (
-                  <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderEmail}</p>
-                ) : (
-                  <p className="mt-1 text-xs text-slate-400">
-                    Used for 3DS 2.0 cardholder verification (invoice receipt still goes to customer email)
-                  </p>
-                )}
-              </div>
-            )}
+                <div className="text-xs sm:text-sm">
+                  <span className="font-semibold text-slate-800">
+                    Paying with someone else&apos;s credit card
+                  </span>
+                  <span className="block text-xs text-slate-500 mt-0.5">
+                    Check this if the cardholder is different from the customer above.
+                  </span>
+                </div>
+              </label>
 
-          {/* Cardholder Mobile Phone (Optional · EMV 3DS 2.0 Risk Scoring / SMS OTP) */}
-          <div>
-            <label htmlFor="cardholder_phone" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
-              <span>Cardholder Mobile Phone</span>
-              <span className="text-xs font-normal text-slate-400">Optional · 3DS 2.0</span>
-            </label>
-            <input
-              id="cardholder_phone"
-              type="tel"
-              value={cardholderPhone}
-              onChange={(e) => {
-                setCardholderPhone(e.target.value);
-                if (fieldErrors.cardholderPhone) {
-                  setFieldErrors((prev) => {
-                    const next = { ...prev };
-                    delete next.cardholderPhone;
-                    return next;
-                  });
-                }
-              }}
-              className={getInputClass('cardholderPhone')}
-              placeholder={`${getCountryDialCode(country)} 8123 4567`}
-              autoComplete="tel"
-              maxLength={24}
-              disabled={isProcessing}
-            />
-            {fieldErrors.cardholderPhone ? (
-              <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderPhone}</p>
-            ) : (
-              <p className="mt-1 text-xs text-slate-400">
-                Optional · International format with country code (recommended for EMV 3DS 2.0 risk scoring &amp; bank OTP)
-              </p>
-            )}
-          </div>
-
-            <div className="rounded-lg border border-white bg-white p-3">
-              <AddressFields
-                idPrefix="payer-address"
-                title="Payer Address"
-                value={payerAddress}
-                config={payerCountryConfig}
-                errors={Object.fromEntries(
-                  Object.entries(fieldErrors)
-                    .filter(([key]) => key.startsWith('payerAddress.'))
-                    .map(([key, message]) => [key.slice('payerAddress.'.length), message]),
-                )}
-                disabled={isProcessing}
-                onChange={handlePayerAddressChange}
-              />
+              {isThirdPartyCard ? (
+                <div className="mt-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  <strong>Third-party card mode:</strong> This card will be processed as a one-time payment and will not be bound to the customer&apos;s profile. Enter the cardholder&apos;s own name and card billing address below.
+                </div>
+              ) : customerName.trim() &&
+                cardholderName.trim() &&
+                customerName.trim().toLowerCase() !== cardholderName.trim().toLowerCase() ? (
+                <div className="mt-2.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-800">
+                  Cardholder name differs from customer name — this transaction will automatically be processed as a one-time third-party card payment.
+                </div>
+              ) : null}
             </div>
+
+            {/* Cardholder Name */}
+            <div>
+              <div className="mb-1.5 flex items-center justify-between gap-2">
+                <label htmlFor="cardholder_name" className="block text-sm font-medium text-slate-700">
+                  Cardholder Name <span className="text-red-500">*</span>
+                </label>
+                {!isThirdPartyCard &&
+                  customerName.trim().length >= 2 &&
+                  cardholderName.trim() !== customerName.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCardholderName(customerName.trim());
+                        if (fieldErrors.cardholderName) {
+                          setFieldErrors((prev) => {
+                            const next = { ...prev };
+                            delete next.cardholderName;
+                            return next;
+                          });
+                        }
+                      }}
+                      disabled={isProcessing}
+                      className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
+                    >
+                      Same as customer
+                    </button>
+                  )}
+              </div>
+              <input
+                id="cardholder_name"
+                type="text"
+                value={cardholderName}
+                onChange={(e) => {
+                  setCardholderName(e.target.value);
+                  if (fieldErrors.cardholderName) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.cardholderName;
+                      return next;
+                    });
+                  }
+                }}
+                className={getInputClass('cardholderName')}
+                placeholder="Full name as printed on card"
+                autoComplete="cc-name"
+                maxLength={70}
+                disabled={isProcessing}
+              />
+              {fieldErrors.cardholderName && (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderName}</p>
+              )}
+            </div>
+
+              {/* Cardholder Email (shown when paying with third-party card or cardholder name differs) */}
+              {showCardholderEmailField && (
+                <div>
+                  <label htmlFor="cardholder_email" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
+                    <span>Cardholder Email</span>
+                    <span className="text-xs font-normal text-slate-400">Optional · 3DS 2.0</span>
+                  </label>
+                  <input
+                    id="cardholder_email"
+                    type="email"
+                    value={cardholderEmail}
+                    onChange={(e) => {
+                      setCardholderEmail(e.target.value);
+                      if (fieldErrors.cardholderEmail) {
+                        setFieldErrors((prev) => {
+                          const next = { ...prev };
+                          delete next.cardholderEmail;
+                          return next;
+                        });
+                      }
+                    }}
+                    className={getInputClass('cardholderEmail')}
+                    placeholder="cardholder@example.com"
+                    disabled={isProcessing}
+                  />
+                  {fieldErrors.cardholderEmail ? (
+                    <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderEmail}</p>
+                  ) : (
+                    <p className="mt-1 text-xs text-slate-400">
+                      Used for 3DS 2.0 cardholder verification (invoice receipt still goes to customer email)
+                    </p>
+                  )}
+                </div>
+              )}
+
+            {/* Cardholder Mobile Phone (Optional · EMV 3DS 2.0 Risk Scoring / SMS OTP) */}
+            <div>
+              <label htmlFor="cardholder_phone" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
+                <span>Cardholder Mobile Phone</span>
+                <span className="text-xs font-normal text-slate-400">Optional · 3DS 2.0</span>
+              </label>
+              <input
+                id="cardholder_phone"
+                type="tel"
+                value={cardholderPhone}
+                onChange={(e) => {
+                  setCardholderPhone(e.target.value);
+                  if (fieldErrors.cardholderPhone) {
+                    setFieldErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.cardholderPhone;
+                      return next;
+                    });
+                  }
+                }}
+                className={getInputClass('cardholderPhone')}
+                placeholder={`${getCountryDialCode(country)} 8123 4567`}
+                autoComplete="tel"
+                maxLength={24}
+                disabled={isProcessing}
+              />
+              {fieldErrors.cardholderPhone ? (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.cardholderPhone}</p>
+              ) : (
+                <p className="mt-1 text-xs text-slate-400">
+                  Optional · International format with country code (recommended for EMV 3DS 2.0 risk scoring &amp; bank OTP)
+                </p>
+              )}
+            </div>
+
           </section>
 
           <section aria-labelledby="card-details-heading" className="rounded-xl border border-slate-200 bg-slate-50/40 p-4 space-y-5">
@@ -2219,364 +2240,364 @@ return (
               <h4 id="card-details-heading" className="text-sm font-semibold text-slate-800">Card details & AVS verification</h4>
               <p className="mt-0.5 text-xs text-slate-500">Billing address must match the address registered with this card.</p>
             </div>
-          {/* Card Number */}
-          <div>
-            <label htmlFor="card" className="mb-1.5 block text-sm font-medium text-slate-700">
-              Card Number <span className="text-red-500">*</span>
-            </label>
-            <div className="relative">
-              <input
-                id="card"
-                type="text"
-                inputMode="numeric"
-                value={cardNumber}
-                onChange={(e) => {
-                  setCardNumber(formatCardNumber(e.target.value));
-                  if (fieldErrors.cardNumber) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.cardNumber;
-                      return next;
-                    });
-                  }
-                }}
-                className={getInputClass('cardNumber') + ' tracking-wider pr-24'}
-                placeholder="•••• •••• •••• ••••"
-                autoComplete="cc-number"
-                maxLength={23}
-                disabled={isProcessing}
-              />
-              <CardBrandIcon brand={cardBrand} />
-            </div>
-            {fieldErrors.cardNumber ? (
-              <p className="mt-1 text-xs text-red-500">{fieldErrors.cardNumber}</p>
-            ) : (
-              <p className="mt-1 text-xs text-slate-400">
-                Accepted for {currencyConfig.code.toUpperCase()}: {currencyConfig.supportedBrandsLabel}
-              </p>
-            )}
-          </div>
-
-          {/* Expiry & CVC */}
-          <div className="grid grid-cols-2 gap-4">
+            {/* Card Number */}
             <div>
-              <label htmlFor="expiry" className="mb-1.5 block text-sm font-medium text-slate-700">
-                Expiration <span className="text-red-500">*</span>
+              <label htmlFor="card" className="mb-1.5 block text-sm font-medium text-slate-700">
+                Card Number <span className="text-red-500">*</span>
               </label>
-              <input
-                id="expiry"
-                type="text"
-                inputMode="numeric"
-                value={expiry}
-                onChange={(e) => {
-                  setExpiry(formatExpiry(e.target.value));
-                  if (fieldErrors.expiry) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.expiry;
-                      return next;
-                    });
-                  }
-                }}
-                className={getInputClass('expiry')}
-                placeholder="MM/YY"
-                autoComplete="cc-exp"
-                maxLength={5}
-                disabled={isProcessing}
-              />
-              {fieldErrors.expiry && (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.expiry}</p>
-              )}
-            </div>
-
-            <div>
-              <label htmlFor="cvc" className="mb-1.5 block text-sm font-medium text-slate-700">
-                Security Code ({cardBrand === 'amex' ? '4 Digits' : 'CVC / CVV'}) <span className="text-red-500">*</span>
-              </label>
-              <input
-                id="cvc"
-                type="password"
-                inputMode="numeric"
-                value={cvc}
-                onChange={(e) => {
-                  setCvc(e.target.value.replace(/\D/g, '').slice(0, maxCvcLength));
-                  if (fieldErrors.cvc) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.cvc;
-                      return next;
-                    });
-                  }
-                }}
-                className={getInputClass('cvc')}
-                placeholder={cardBrand === 'amex' ? '••••' : '•••'}
-                autoComplete="cc-csc"
-                maxLength={maxCvcLength}
-                disabled={isProcessing}
-              />
-              {fieldErrors.cvc && (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.cvc}</p>
-              )}
-            </div>
-          </div>
-
-          {/* Cardholder Billing Address (AVS Standard) */}
-          <div className="space-y-4 pt-2 border-t border-slate-100">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                Cardholder Billing Address (AVS)
-              </span>
-              <div className="h-px flex-1 bg-slate-100" />
-            </div>
-
-            {/* AVS Notification Banner */}
-            {countryConfig.isAvsStrict ? (
-              <div className="rounded-xl border border-indigo-100 bg-indigo-50/70 p-3 text-xs text-indigo-900">
-                <div className="flex items-start gap-2">
-                  <span className="text-sm">🛡️</span>
-                  <div>
-                    <span className="font-semibold">Cardholder AVS Verification Required:</span>
-                    <p className="mt-0.5 text-indigo-700">
-                      Enter the billing address registered on the <strong>cardholder&apos;s</strong> {countryConfig.name} credit card statement (not the customer&apos;s address if paying with someone else&apos;s card).
-                    </p>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="rounded-xl border border-slate-100 bg-slate-50 p-2.5 text-xs text-slate-600">
-                <span>
-                  🌍 Cardholder Billing Address: Enter the billing address registered with this credit card.
-                </span>
-              </div>
-            )}
-
-            {/* Country Selection */}
-            <div>
-              <label htmlFor="country" className="mb-1.5 block text-sm font-medium text-slate-700">
-                Country / Region of Card Issuance <span className="text-red-500">*</span>
-              </label>
-              <select
-                id="country"
-                value={country}
-                onChange={(e) => handleCountryChange(e.target.value)}
-                className={
-                  getInputClass('country') +
-                  ' appearance-none bg-[url(\'data:image/svg+xml;charset=UTF-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%236b7280%22%20d%3D%22M2%204l4%204%204-4%22%2F%3E%3C%2Fsvg%3E\')] bg-[length:12px] bg-[right_12px_center] bg-no-repeat pr-8'
-                }
-                disabled={isProcessing}
-                autoComplete="country"
-              >
-                <optgroup label="Popular Countries & Regions">
-                  {POPULAR_COUNTRIES.map((c) => (
-                    <option key={`pop_${c.code}`} value={c.code}>
-                      {c.name} ({c.code})
-                    </option>
-                  ))}
-                </optgroup>
-                <optgroup label="All Countries & Regions (A-Z)">
-                  {SORTED_ALL_COUNTRIES.map((c) => (
-                    <option key={`all_${c.code}`} value={c.code}>
-                      {c.name} ({c.code})
-                    </option>
-                  ))}
-                </optgroup>
-              </select>
-              {fieldErrors.country && (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.country}</p>
-              )}
-            </div>
-
-            {/* Street Address Line 1 */}
-            <div>
-              <label htmlFor="street1" className="mb-1.5 block text-sm font-medium text-slate-700">
-                Street Address (Line 1) <span className="text-red-500">*</span>
-              </label>
-              <input
-                id="street1"
-                type="text"
-                value={street1}
-                onChange={(e) => {
-                  setStreet1(e.target.value);
-                  if (fieldErrors.street1) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.street1;
-                      return next;
-                    });
-                  }
-                }}
-                className={getInputClass('street1')}
-                placeholder={
-                  countryConfig.isAvsStrict
-                    ? 'Building / House number and street name (e.g. 123 Main St)'
-                    : 'Street name and building number'
-                }
-                autoComplete="address-line1"
-                maxLength={50}
-                disabled={isProcessing}
-              />
-              {fieldErrors.street1 ? (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.street1}</p>
-              ) : countryConfig.isAvsStrict ? (
-                <p className="mt-1 text-xs text-indigo-500">
-                  Tip: AVS specifically verifies the house/building number in this line.
-                </p>
-              ) : null}
-            </div>
-
-            {/* Street Address Line 2 (Optional) */}
-            <div>
-              <label htmlFor="street2" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
-                <span>Address Line 2</span>
-                <span className="text-xs font-normal text-slate-400">Optional</span>
-              </label>
-              <input
-                id="street2"
-                type="text"
-                value={street2}
-                onChange={(e) => {
-                  setStreet2(e.target.value);
-                  if (fieldErrors.street2) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.street2;
-                      return next;
-                    });
-                  }
-                }}
-                className={getInputClass('street2')}
-                placeholder="Apt, Suite, Unit, Floor, Building name"
-                autoComplete="address-line2"
-                maxLength={50}
-                disabled={isProcessing}
-              />
-              {fieldErrors.street2 && (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.street2}</p>
-              )}
-            </div>
-
-            {/* City */}
-            <div>
-              <label htmlFor="city" className="mb-1.5 block text-sm font-medium text-slate-700">
-                City / Town <span className="text-red-500">*</span>
-              </label>
-              <input
-                id="city"
-                type="text"
-                value={city}
-                onChange={(e) => {
-                  setCity(e.target.value);
-                  if (fieldErrors.city) {
-                    setFieldErrors((prev) => {
-                      const next = { ...prev };
-                      delete next.city;
-                      return next;
-                    });
-                  }
-                }}
-                className={getInputClass('city')}
-                placeholder="City name"
-                autoComplete="address-level2"
-                maxLength={50}
-                disabled={isProcessing}
-              />
-              {fieldErrors.city && (
-                <p className="mt-1 text-xs text-red-500">{fieldErrors.city}</p>
-              )}
-            </div>
-
-            {/* State/Province & Postal Code Grid */}
-            <div className={`grid gap-4 ${countryConfig.hasStates ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'}`}>
-              {/* State / Province (shown when country has states/subdivisions) */}
-              {countryConfig.hasStates && (
-                <div>
-                  <label htmlFor="state" className="mb-1.5 block text-sm font-medium text-slate-700">
-                    {countryConfig.stateLabel} <span className="text-red-500">*</span>
-                  </label>
-                  {countryConfig.states && countryConfig.states.length > 0 ? (
-                    <select
-                      id="state"
-                      value={state}
-                      onChange={(e) => {
-                        setState(e.target.value);
-                        if (fieldErrors.state) {
-                          setFieldErrors((prev) => {
-                            const next = { ...prev };
-                            delete next.state;
-                            return next;
-                          });
-                        }
-                      }}
-                      className={
-                        getInputClass('state') +
-                        ' appearance-none bg-[url(\'data:image/svg+xml;charset=UTF-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%236b7280%22%20d%3D%22M2%204l4%204%204-4%22%2F%3E%3C%2Fsvg%3E\')] bg-[length:12px] bg-[right_12px_center] bg-no-repeat pr-8'
-                      }
-                      disabled={isProcessing}
-                      autoComplete="address-level1"
-                    >
-                      <option value="">Select {countryConfig.stateLabel}…</option>
-                      {countryConfig.states.map((s) => (
-                        <option key={s.code} value={s.code}>
-                          {s.code} – {s.name}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      id="state"
-                      type="text"
-                      value={state}
-                      onChange={(e) => {
-                        setState(e.target.value);
-                        if (fieldErrors.state) {
-                          setFieldErrors((prev) => {
-                            const next = { ...prev };
-                            delete next.state;
-                            return next;
-                          });
-                        }
-                      }}
-                      className={getInputClass('state')}
-                      placeholder={countryConfig.stateLabel}
-                      autoComplete="address-level1"
-                      maxLength={50}
-                      disabled={isProcessing}
-                    />
-                  )}
-                  {fieldErrors.state && (
-                    <p className="mt-1 text-xs text-red-500">{fieldErrors.state}</p>
-                  )}
-                </div>
-              )}
-
-              {/* Postal / ZIP Code */}
-              <div>
-                <label htmlFor="postal_code" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
-                  <span>
-                    {countryConfig.postalLabel} {countryConfig.postalRequired && <span className="text-red-500">*</span>}
-                  </span>
-                  {!countryConfig.postalRequired && (
-                    <span className="text-xs font-normal text-slate-400">Optional</span>
-                  )}
-                </label>
+              <div className="relative">
                 <input
-                  id="postal_code"
+                  id="card"
                   type="text"
-                  value={postalCode}
-                  onChange={(e) => handlePostalChange(e.target.value)}
-                  onBlur={handlePostalBlur}
-                  className={getInputClass('postalCode')}
-                  placeholder={countryConfig.postalPlaceholder}
-                  autoComplete="postal-code"
-                  maxLength={16}
+                  inputMode="numeric"
+                  value={cardNumber}
+                  onChange={(e) => {
+                    setCardNumber(formatCardNumber(e.target.value));
+                    if (fieldErrors.cardNumber) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.cardNumber;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('cardNumber') + ' tracking-wider pr-24'}
+                  placeholder="•••• •••• •••• ••••"
+                  autoComplete="cc-number"
+                  maxLength={23}
                   disabled={isProcessing}
                 />
-                {fieldErrors.postalCode && (
-                  <p className="mt-1 text-xs text-red-500">{fieldErrors.postalCode}</p>
+                <CardBrandIcon brand={cardBrand} />
+              </div>
+              {fieldErrors.cardNumber ? (
+                <p className="mt-1 text-xs text-red-500">{fieldErrors.cardNumber}</p>
+              ) : (
+                <p className="mt-1 text-xs text-slate-400">
+                  Accepted for {currencyConfig.code.toUpperCase()}: {currencyConfig.supportedBrandsLabel}
+                </p>
+              )}
+            </div>
+
+            {/* Expiry & CVC */}
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="expiry" className="mb-1.5 block text-sm font-medium text-slate-700">
+                  Expiration <span className="text-red-500">*</span>
+                </label>
+                <input
+                  id="expiry"
+                  type="text"
+                  inputMode="numeric"
+                  value={expiry}
+                  onChange={(e) => {
+                    setExpiry(formatExpiry(e.target.value));
+                    if (fieldErrors.expiry) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.expiry;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('expiry')}
+                  placeholder="MM/YY"
+                  autoComplete="cc-exp"
+                  maxLength={5}
+                  disabled={isProcessing}
+                />
+                {fieldErrors.expiry && (
+                  <p className="mt-1 text-xs text-red-500">{fieldErrors.expiry}</p>
+                )}
+              </div>
+
+              <div>
+                <label htmlFor="cvc" className="mb-1.5 block text-sm font-medium text-slate-700">
+                  Security Code ({cardBrand === 'amex' ? '4 Digits' : 'CVC / CVV'}) <span className="text-red-500">*</span>
+                </label>
+                <input
+                  id="cvc"
+                  type="password"
+                  inputMode="numeric"
+                  value={cvc}
+                  onChange={(e) => {
+                    setCvc(e.target.value.replace(/\D/g, '').slice(0, maxCvcLength));
+                    if (fieldErrors.cvc) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.cvc;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('cvc')}
+                  placeholder={cardBrand === 'amex' ? '••••' : '•••'}
+                  autoComplete="cc-csc"
+                  maxLength={maxCvcLength}
+                  disabled={isProcessing}
+                />
+                {fieldErrors.cvc && (
+                  <p className="mt-1 text-xs text-red-500">{fieldErrors.cvc}</p>
                 )}
               </div>
             </div>
-          </div>
+
+            {/* Cardholder Billing Address (AVS Standard) */}
+            <div className="space-y-4 pt-2 border-t border-slate-100">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  Cardholder Billing Address (AVS)
+                </span>
+                <div className="h-px flex-1 bg-slate-100" />
+              </div>
+
+              {/* AVS Notification Banner */}
+              {countryConfig.isAvsStrict ? (
+                <div className="rounded-xl border border-indigo-100 bg-indigo-50/70 p-3 text-xs text-indigo-900">
+                  <div className="flex items-start gap-2">
+                    <span className="text-sm">🛡️</span>
+                    <div>
+                      <span className="font-semibold">Cardholder AVS Verification Required:</span>
+                      <p className="mt-0.5 text-indigo-700">
+                        Enter the billing address registered on the <strong>cardholder&apos;s</strong> {countryConfig.name} credit card statement (not the customer&apos;s address if paying with someone else&apos;s card).
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-xl border border-slate-100 bg-slate-50 p-2.5 text-xs text-slate-600">
+                  <span>
+                    🌍 Cardholder Billing Address: Enter the billing address registered with this credit card.
+                  </span>
+                </div>
+              )}
+
+              {/* Country Selection */}
+              <div>
+                <label htmlFor="country" className="mb-1.5 block text-sm font-medium text-slate-700">
+                  Country / Region of Card Issuance <span className="text-red-500">*</span>
+                </label>
+                <select
+                  id="country"
+                  value={country}
+                  onChange={(e) => handleCountryChange(e.target.value)}
+                  className={
+                    getInputClass('country') +
+                    ' appearance-none bg-[url(\'data:image/svg+xml;charset=UTF-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%236b7280%22%20d%3D%22M2%204l4%204%204-4%22%2F%3E%3C%2Fsvg%3E\')] bg-[length:12px] bg-[right_12px_center] bg-no-repeat pr-8'
+                  }
+                  disabled={isProcessing}
+                  autoComplete="country"
+                >
+                  <optgroup label="Popular Countries & Regions">
+                    {POPULAR_COUNTRIES.map((c) => (
+                      <option key={`pop_${c.code}`} value={c.code}>
+                        {c.name} ({c.code})
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="All Countries & Regions (A-Z)">
+                    {SORTED_ALL_COUNTRIES.map((c) => (
+                      <option key={`all_${c.code}`} value={c.code}>
+                        {c.name} ({c.code})
+                      </option>
+                    ))}
+                  </optgroup>
+                </select>
+                {fieldErrors.country && (
+                  <p className="mt-1 text-xs text-red-500">{fieldErrors.country}</p>
+                )}
+              </div>
+
+              {/* Street Address Line 1 */}
+              <div>
+                <label htmlFor="street1" className="mb-1.5 block text-sm font-medium text-slate-700">
+                  Street Address (Line 1) <span className="text-red-500">*</span>
+                </label>
+                <input
+                  id="street1"
+                  type="text"
+                  value={street1}
+                  onChange={(e) => {
+                    setStreet1(e.target.value);
+                    if (fieldErrors.street1) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.street1;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('street1')}
+                  placeholder={
+                    countryConfig.isAvsStrict
+                      ? 'Building / House number and street name (e.g. 123 Main St)'
+                      : 'Street name and building number'
+                  }
+                  autoComplete="address-line1"
+                  maxLength={50}
+                  disabled={isProcessing}
+                />
+                {fieldErrors.street1 ? (
+                  <p className="mt-1 text-xs text-red-500">{fieldErrors.street1}</p>
+                ) : countryConfig.isAvsStrict ? (
+                  <p className="mt-1 text-xs text-indigo-500">
+                    Tip: AVS specifically verifies the house/building number in this line.
+                  </p>
+                ) : null}
+              </div>
+
+              {/* Street Address Line 2 (Optional) */}
+              <div>
+                <label htmlFor="street2" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
+                  <span>Address Line 2</span>
+                  <span className="text-xs font-normal text-slate-400">Optional</span>
+                </label>
+                <input
+                  id="street2"
+                  type="text"
+                  value={street2}
+                  onChange={(e) => {
+                    setStreet2(e.target.value);
+                    if (fieldErrors.street2) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.street2;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('street2')}
+                  placeholder="Apt, Suite, Unit, Floor, Building name"
+                  autoComplete="address-line2"
+                  maxLength={50}
+                  disabled={isProcessing}
+                />
+                {fieldErrors.street2 && (
+                  <p className="mt-1 text-xs text-red-500">{fieldErrors.street2}</p>
+                )}
+              </div>
+
+              {/* City */}
+              <div>
+                <label htmlFor="city" className="mb-1.5 block text-sm font-medium text-slate-700">
+                  City / Town <span className="text-red-500">*</span>
+                </label>
+                <input
+                  id="city"
+                  type="text"
+                  value={city}
+                  onChange={(e) => {
+                    setCity(e.target.value);
+                    if (fieldErrors.city) {
+                      setFieldErrors((prev) => {
+                        const next = { ...prev };
+                        delete next.city;
+                        return next;
+                      });
+                    }
+                  }}
+                  className={getInputClass('city')}
+                  placeholder="City name"
+                  autoComplete="address-level2"
+                  maxLength={50}
+                  disabled={isProcessing}
+                />
+                {fieldErrors.city && (
+                  <p className="mt-1 text-xs text-red-500">{fieldErrors.city}</p>
+                )}
+              </div>
+
+              {/* State/Province & Postal Code Grid */}
+              <div className={`grid gap-4 ${countryConfig.hasStates ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'}`}>
+                {/* State / Province (shown when country has states/subdivisions) */}
+                {countryConfig.hasStates && (
+                  <div>
+                    <label htmlFor="state" className="mb-1.5 block text-sm font-medium text-slate-700">
+                      {countryConfig.stateLabel} <span className="text-red-500">*</span>
+                    </label>
+                    {countryConfig.states && countryConfig.states.length > 0 ? (
+                      <select
+                        id="state"
+                        value={state}
+                        onChange={(e) => {
+                          setState(e.target.value);
+                          if (fieldErrors.state) {
+                            setFieldErrors((prev) => {
+                              const next = { ...prev };
+                              delete next.state;
+                              return next;
+                            });
+                          }
+                        }}
+                        className={
+                          getInputClass('state') +
+                          ' appearance-none bg-[url(\'data:image/svg+xml;charset=UTF-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%236b7280%22%20d%3D%22M2%204l4%204%204-4%22%2F%3E%3C%2Fsvg%3E\')] bg-[length:12px] bg-[right_12px_center] bg-no-repeat pr-8'
+                        }
+                        disabled={isProcessing}
+                        autoComplete="address-level1"
+                      >
+                        <option value="">Select {countryConfig.stateLabel}…</option>
+                        {countryConfig.states.map((s) => (
+                          <option key={s.code} value={s.code}>
+                            {s.code} – {s.name}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        id="state"
+                        type="text"
+                        value={state}
+                        onChange={(e) => {
+                          setState(e.target.value);
+                          if (fieldErrors.state) {
+                            setFieldErrors((prev) => {
+                              const next = { ...prev };
+                              delete next.state;
+                              return next;
+                            });
+                          }
+                        }}
+                        className={getInputClass('state')}
+                        placeholder={countryConfig.stateLabel}
+                        autoComplete="address-level1"
+                        maxLength={50}
+                        disabled={isProcessing}
+                      />
+                    )}
+                    {fieldErrors.state && (
+                      <p className="mt-1 text-xs text-red-500">{fieldErrors.state}</p>
+                    )}
+                  </div>
+                )}
+
+                {/* Postal / ZIP Code */}
+                <div>
+                  <label htmlFor="postal_code" className="mb-1.5 flex items-center justify-between text-sm font-medium text-slate-700">
+                    <span>
+                      {countryConfig.postalLabel} {countryConfig.postalRequired && <span className="text-red-500">*</span>}
+                    </span>
+                    {!countryConfig.postalRequired && (
+                      <span className="text-xs font-normal text-slate-400">Optional</span>
+                    )}
+                  </label>
+                  <input
+                    id="postal_code"
+                    type="text"
+                    value={postalCode}
+                    onChange={(e) => handlePostalChange(e.target.value)}
+                    onBlur={handlePostalBlur}
+                    className={getInputClass('postalCode')}
+                    placeholder={countryConfig.postalPlaceholder}
+                    autoComplete="postal-code"
+                    maxLength={16}
+                    disabled={isProcessing}
+                  />
+                  {fieldErrors.postalCode && (
+                    <p className="mt-1 text-xs text-red-500">{fieldErrors.postalCode}</p>
+                  )}
+                </div>
+              </div>
+            </div>
 
           </section>
         </div>

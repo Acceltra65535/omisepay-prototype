@@ -1201,26 +1201,26 @@ const chargeApi = (): MiddlewareHandler => {
         const cardholderName = payer?.cardholder_name ? String(payer.cardholder_name).trim() : '';
         const cardholderEmail = payer?.cardholder_email ? String(payer.cardholder_email).trim() : '';
         const cardholderPhone = payer?.cardholder_phone ? String(payer.cardholder_phone).trim() : '';
-        const payerAddress = payer?.address;
-        const normalizedPayerAddress = payerAddress && typeof payerAddress === 'object'
+        const customerAddress = customer?.address;
+        const normalizedCustomerAddress = customerAddress && typeof customerAddress === 'object'
           ? {
-            country: typeof payerAddress.country === 'string' ? payerAddress.country.trim().toUpperCase() : '',
-            street1: typeof payerAddress.street1 === 'string' ? payerAddress.street1.trim() : '',
-            street2: typeof payerAddress.street2 === 'string' ? payerAddress.street2.trim() : '',
-            city: typeof payerAddress.city === 'string' ? payerAddress.city.trim() : '',
-            state: typeof payerAddress.state === 'string' ? payerAddress.state.trim() : '',
-            postalCode: typeof payerAddress.postal_code === 'string' ? payerAddress.postal_code.trim() : '',
+            country: typeof customerAddress.country === 'string' ? customerAddress.country.trim().toUpperCase() : '',
+            street1: typeof customerAddress.street1 === 'string' ? customerAddress.street1.trim() : '',
+            street2: typeof customerAddress.street2 === 'string' ? customerAddress.street2.trim() : '',
+            city: typeof customerAddress.city === 'string' ? customerAddress.city.trim() : '',
+            state: typeof customerAddress.state === 'string' ? customerAddress.state.trim() : '',
+            postalCode: typeof customerAddress.postal_code === 'string' ? customerAddress.postal_code.trim() : '',
           }
           : null;
 
         if (!is_apple_pay) {
-          if (!normalizedPayerAddress) {
-            return c.json({ error: 'Payer address is required' }, 400);
+          if (!normalizedCustomerAddress) {
+            return c.json({ error: 'Customer address is required' }, 400);
           }
-          const payerAddressConfig = getCountryByCode(normalizedPayerAddress.country);
-          const payerAddressValidation = validateAvsAddress(normalizedPayerAddress, payerAddressConfig);
-          if (!payerAddressValidation.isValid) {
-            return c.json({ error: payerAddressValidation.firstError || 'Invalid payer address' }, 400);
+          const customerAddressConfig = getCountryByCode(normalizedCustomerAddress.country);
+          const customerAddressValidation = validateAvsAddress(normalizedCustomerAddress, customerAddressConfig);
+          if (!customerAddressValidation.isValid) {
+            return c.json({ error: customerAddressValidation.firstError || 'Invalid customer address' }, 400);
           }
         }
 
@@ -1299,12 +1299,12 @@ const chargeApi = (): MiddlewareHandler => {
             cardholder_email: cardholderEmail,
             cardholder_phone: cardholderPhone,
             is_third_party_card: isThirdPartyCard,
-            payer_address_country: normalizedPayerAddress?.country || '',
-            payer_address_street1: normalizedPayerAddress?.street1 || '',
-            payer_address_street2: normalizedPayerAddress?.street2 || '',
-            payer_address_city: normalizedPayerAddress?.city || '',
-            payer_address_state: normalizedPayerAddress?.state || '',
-            payer_address_postal_code: normalizedPayerAddress?.postalCode || '',
+            customer_address_country: normalizedCustomerAddress?.country || '',
+            customer_address_street1: normalizedCustomerAddress?.street1 || '',
+            customer_address_street2: normalizedCustomerAddress?.street2 || '',
+            customer_address_city: normalizedCustomerAddress?.city || '',
+            customer_address_state: normalizedCustomerAddress?.state || '',
+            customer_address_postal_code: normalizedCustomerAddress?.postalCode || '',
             charge_currency: finalCurrency.toUpperCase(),
             payment_method: is_apple_pay ? 'apple_pay' : 'card',
             three_ds_required: OMISE_CONFIG.threeDS.required,
