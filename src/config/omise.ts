@@ -11,7 +11,6 @@ export interface CurrencyConfig {
   countryCode: string;
   minSubunits: number;
   maxSubunits: number;
-  defaultAmount: string;
   supportedBrands: readonly CardBrand[];
   applePayNetworks: readonly ('visa' | 'masterCard' | 'jcb')[];
   supportedBrandsLabel: string;
@@ -27,7 +26,6 @@ export const SUPPORTED_CURRENCIES: Record<SupportedCurrency, CurrencyConfig> = {
     countryCode: 'SG',
     minSubunits: 100,      // 最低 S$1.00
     maxSubunits: 2000000,  // 最高 S$20,000.00
-    defaultAmount: '1500.00',
     supportedBrands: ['visa', 'mastercard', 'jcb'],
     applePayNetworks: ['visa', 'masterCard', 'jcb'],
     supportedBrandsLabel: 'Visa, Mastercard, JCB',
@@ -41,7 +39,6 @@ export const SUPPORTED_CURRENCIES: Record<SupportedCurrency, CurrencyConfig> = {
     countryCode: 'SG',     // Processed via Omise SG account
     minSubunits: 100,      // 最低 CA$1.00
     maxSubunits: 2000000,  // 最高 CA$20,000.00
-    defaultAmount: '1350.00',
     supportedBrands: ['visa', 'mastercard'],
     applePayNetworks: ['visa', 'masterCard'],
     supportedBrandsLabel: 'Visa, Mastercard',

@@ -450,14 +450,14 @@ function AddressFields({
 export const PaymentForm = () => {
   // Customer & Order Identity Fields (separated from Cardholder / Payment Info)
   const [invoiceNumber, setInvoiceNumber] = useState(() => generateOrderNumber());
-  const [invoiceDescription, setInvoiceDescription] = useState('Professional Consulting Services');
+  const [invoiceDescription, setInvoiceDescription] = useState('');
   const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
 
   // Payment Currency & Amount (SGD default, plus CAD)
   const [currency, setCurrency] = useState<SupportedCurrency>('sgd');
   const currencyConfig = SUPPORTED_CURRENCIES[currency];
-  const [amount, setAmount] = useState('1500.00');
+  const [amount, setAmount] = useState('');
   const [exchangeRates, setExchangeRates] = useState<ExchangeRatesData | null>(null);
 
   // Cardholder & Card Payment Details (can belong to a third-party cardholder)
@@ -1355,6 +1355,7 @@ export const PaymentForm = () => {
       }
     }
     setInvoiceNumber(generateOrderNumber());
+    setInvoiceDescription('');
     setCustomerName('');
     setCustomerEmail('');
     setIsThirdPartyCard(false);
@@ -1364,7 +1365,7 @@ export const PaymentForm = () => {
     setCardNumber('');
     setExpiry('');
     setCvc('');
-    setAmount('1500.00');
+    setAmount('');
     setCountry('US');
     setStreet1('');
     setStreet2('');

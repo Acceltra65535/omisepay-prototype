@@ -191,7 +191,7 @@ sequenceDiagram
 - **CAD 限额注意**：应用当前金额上限是商户侧配置，Omise SG 的多币种交易限额按结算资金与账户设置执行；上线前应以 Omise Dashboard / 账户团队确认的 CAD 限额为准，不能把参考汇率当作授权金额或限额依据。
 - **Omise 请求可靠性**：charge 请求把前端为单次付款生成的 UUID `client_ref` 同时用作 Omise `ref_id`，避免同一请求重试创建重复 charge；本地仍需对同一发票号的独立重复付款做业务级拦截。
 - **风控上下文**：charge 的 `ip` 只取自 Nginx 解析并校验过的实际客户端 IP；不接受请求体里的 IP/UA 作为风控字段。Cloudflare 来源网段要持续更新，避免把边缘节点地址或伪造头传给 Omise。
-- **防跨页参考汇率错乱**：回执页使用与 `chargeResult.amount` 和 `chargeResult.currency` 绑定的 `receiptCurrencyReference` 计算展示，避免 3DS 整页回跳后被重置的表单默认金额（`1500.00 SGD`）污染回执显示。
+- **防跨页参考汇率错乱**：回执页使用与 `chargeResult.amount` 和 `chargeResult.currency` 绑定的 `receiptCurrencyReference` 计算展示，避免 3DS 整页回跳后使用空白表单状态污染回执显示。
 
 ### 5.3 订单号、金额精度与卡号校验
 - **订单号生成 (`generateOrderNumber`)**：格式为 `CBJ` + `13 位毫秒级时间戳` + `5 位随机字符`（通过 `crypto.getRandomValues` + Fisher-Yates 洗牌确保同时包含大写字母、小写字母与数字，不含任何 `-`），例如 `CBJ1795508855309kpj2B`。
