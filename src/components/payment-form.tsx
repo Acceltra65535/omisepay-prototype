@@ -1838,18 +1838,18 @@ return (
         {/* ═══════════════════════════════════════════════ */}
         {/* Step 1: Customer & Order Information            */}
         {/* ═══════════════════════════════════════════════ */}
-        <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-4 sm:p-5 space-y-4">
+        <div aria-labelledby="customer-order-heading" className="rounded-2xl border border-indigo-100 bg-indigo-50/20 p-4 sm:p-5 space-y-4">
           <div className="flex items-start justify-between gap-3 border-b border-slate-200/70 pb-3">
             <div className="flex items-center gap-2.5">
               <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-xs font-bold text-white">
                 1
               </span>
               <div>
-                <h3 className="text-sm font-bold text-slate-800">
-                  Customer & Order Information
+                <h3 id="customer-order-heading" className="text-sm font-bold text-slate-800">
+                  Customer & Order
                 </h3>
                 <p className="text-xs text-slate-500">
-                  Who this invoice belongs to (receives the receipt & order confirmation).
+                  The invoice recipient. Payment receipts and order confirmations go to this customer.
                 </p>
               </div>
             </div>
@@ -1985,18 +1985,18 @@ return (
         {/* ═══════════════════════════════════════════════ */}
         {/* Step 2: Payment Method & Cardholder Details     */}
         {/* ═══════════════════════════════════════════════ */}
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 sm:p-5 space-y-5 shadow-sm">
+        <div aria-labelledby="payment-cardholder-heading" className="rounded-2xl border border-slate-300 bg-white p-4 sm:p-5 space-y-5 shadow-sm">
           <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
             <div className="flex items-center gap-2.5">
               <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-900 text-xs font-bold text-white">
                 2
               </span>
               <div>
-                <h3 className="text-sm font-bold text-slate-800">
-                  Payment Method & Cardholder Details
+                <h3 id="payment-cardholder-heading" className="text-sm font-bold text-slate-800">
+                  Cardholder & Payment
                 </h3>
                 <p className="text-xs text-slate-500">
-                  Cardholder details, payer address, and card billing address are collected separately.
+                  Enter the person paying and the card details used to authorize this payment.
                 </p>
               </div>
             </div>
@@ -2025,6 +2025,12 @@ return (
               </div>
             </div>
           )}
+
+          <section aria-labelledby="payer-details-heading" className="rounded-xl border border-indigo-100 bg-indigo-50/30 p-4 space-y-4">
+            <div>
+              <h4 id="payer-details-heading" className="text-sm font-semibold text-slate-800">Payer details</h4>
+              <p className="mt-0.5 text-xs text-slate-500">These details identify the person making the payment.</p>
+            </div>
 
           {/* Third-Party Cardholder Toggle */}
           <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
@@ -2191,6 +2197,28 @@ return (
             )}
           </div>
 
+            <div className="rounded-lg border border-white bg-white p-3">
+              <AddressFields
+                idPrefix="payer-address"
+                title="Payer Address"
+                value={payerAddress}
+                config={payerCountryConfig}
+                errors={Object.fromEntries(
+                  Object.entries(fieldErrors)
+                    .filter(([key]) => key.startsWith('payerAddress.'))
+                    .map(([key, message]) => [key.slice('payerAddress.'.length), message]),
+                )}
+                disabled={isProcessing}
+                onChange={handlePayerAddressChange}
+              />
+            </div>
+          </section>
+
+          <section aria-labelledby="card-details-heading" className="rounded-xl border border-slate-200 bg-slate-50/40 p-4 space-y-5">
+            <div>
+              <h4 id="card-details-heading" className="text-sm font-semibold text-slate-800">Card details & AVS verification</h4>
+              <p className="mt-0.5 text-xs text-slate-500">Billing address must match the address registered with this card.</p>
+            </div>
           {/* Card Number */}
           <div>
             <label htmlFor="card" className="mb-1.5 block text-sm font-medium text-slate-700">
@@ -2550,24 +2578,7 @@ return (
             </div>
           </div>
 
-          <div className="rounded-xl border border-slate-100 bg-slate-50/60 p-4">
-            <p className="mb-3 text-xs text-slate-600">
-              Enter the payer&apos;s own address. This is stored separately from the card billing address used for AVS.
-            </p>
-            <AddressFields
-              idPrefix="payer-address"
-              title="Payer Address"
-              value={payerAddress}
-              config={payerCountryConfig}
-              errors={Object.fromEntries(
-                Object.entries(fieldErrors)
-                  .filter(([key]) => key.startsWith('payerAddress.'))
-                  .map(([key, message]) => [key.slice('payerAddress.'.length), message]),
-              )}
-              disabled={isProcessing}
-              onChange={handlePayerAddressChange}
-            />
-          </div>
+          </section>
         </div>
 
         {/* Top Error Message Banner */}
