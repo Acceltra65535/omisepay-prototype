@@ -9,14 +9,14 @@ export default async function AboutPage() {
           About OmisePay SG
         </h1>
         <p className="mt-3 text-sm leading-relaxed text-slate-600">
-          OmisePay SG is a secure multi-currency checkout portal built for Omise Singapore, separating Customer order identity from Cardholder payment details for transparent receipts and higher international approval rates.
+          OmisePay SG is a secure multi-currency checkout portal built for Omise Singapore, separating Customer order information from Cardholder payment and AVS details.
         </p>
       </div>
 
       <div className="space-y-2 rounded-xl border border-slate-100 bg-slate-50 p-4 text-sm text-slate-700">
         <div className="font-semibold text-slate-900">Supported Payment Capabilities</div>
         <ul className="list-disc space-y-1 pl-5 text-xs sm:text-sm text-slate-600">
-          <li>Currencies: SGD (Visa, Mastercard, JCB), USD &amp; CAD (Visa, Mastercard)</li>
+          <li>Currencies: SGD (Visa, Mastercard, JCB), CAD (Visa, Mastercard)</li>
           <li>Apple Pay on the Web with Singapore merchant validation</li>
           <li>Mandatory 3D Secure 2.0 authentication &amp; backend verification guard</li>
           <li>International AVS billing address normalization and verification</li>

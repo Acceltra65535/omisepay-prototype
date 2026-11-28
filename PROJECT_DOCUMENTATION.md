@@ -6,10 +6,10 @@
 
 ## 1. 项目概述
 
-**OmisePay SG** 是一个基于 **Waku (React Server Components)** 与 **Hono** 构建的轻量级 **Omise Singapore (SG)** 多币种国际支付门户。项目支持国际信用卡与 Apple Pay on the Web，在保证前端敏感卡号不经过商户后端的前提下，实现了以下核心能力：
+**OmisePay SG** 是一个基于 **Waku (React Server Components)** 与 **Hono** 构建的轻量级 **Omise Singapore (SG)** 多币种国际支付门户。项目仅开放 SGD 与 CAD 支付，并支持国际信用卡与 Apple Pay on the Web，在保证前端敏感卡号不经过商户后端的前提下，实现了以下核心能力：
 
-- **客户与持卡人彻底分离（Customer vs. Payer）**：支持第三方代付（用他人信用卡付款），并自动阻断第三方卡绑定至客户 Omise Customer 档案，避免“串卡”与账单地址污染。
-- **多币种与卡组织合规校验**：默认结算与展示支持 **SGD（Visa / Mastercard / JCB）**，并原生支持 Omise Multi-Currency **USD / CAD（仅限 Visa / Mastercard）**，配备动态参考汇率换算（实时接口 + 安全回退）。
+- **客户与持卡人彻底分离（Customer vs. Cardholder）**：支持第三方代付（用他人信用卡付款），并自动阻断第三方卡绑定至客户 Omise Customer 档案，避免“串卡”与账单地址污染。
+- **多币种与卡组织合规校验**：支持 **SGD（Visa / Mastercard / JCB）** 与 Omise Singapore Multi-Currency **CAD（仅限 Visa / Mastercard）**，配备仅供参考的 CAD/SGD 汇率展示（实时接口 + 安全回退）。
 - **EMV 3D Secure 2.0 参数补全与后端预授权强拦截**：前端在 Token 化阶段注入 `email`、可选国际手机号 `phone_number` 及国际 AVS 地址；后端对普通银行卡默认使用 `capture: false` 预授权，并在确认 `authenticated_by` 为 `'3DS'` 或 `'PASSKEY'` 后自动 Capture 请款，对未经 3DS 认证的预授权自动 Reverse 撤单拒付。
 - **Apple Pay on the Web（SG）**：服务端基于 Apple 商户身份证书与私钥执行 mTLS 商户验证，通过 `vault.omise.co/tokens` 执行 `applepay` Token 化，并按原生生物识别通道处理（不误触发 3DS 撤单）。
 - **Webhook 异步回调验签与本地持久化**：严格使用 `crypto.timingSafeEqual` 校验 HMAC-SHA256 签名，结合事件去重与 `data/charge-store.json` 7 天 TTL 原子化磁盘持久化，确保 3DS 回跳与服务重启后订单状态可追溯。
@@ -64,7 +64,7 @@
     ├── global.d.ts
     ├── styles.css
     ├── config/
-    │   ├── omise.ts            # 多币种配置（SGD/USD/CAD）、3DS 策略、卡组织限制、环境判定
+    │   ├── omise.ts            # 多币种配置（SGD/CAD）、3DS 策略、卡组织限制、环境判定
     │   └── countries.ts        # 236 条国际国家/地区 AVS 规则（州省代码、邮编正则与格式化）
     ├── middleware/
     │   ├── charge-api.ts       # 核心 Hono API（配置下发、扣款、3DS 守卫、Apple Pay、Webhook、查单）
@@ -93,7 +93,7 @@
 ```mermaid
 flowchart LR
     U["用户浏览器 / Safari (Apple Pay)"] -->|HTTPS TLS 1.2+| N["Nginx (nginx:alpine :80/:443)"]
-    N -->|HTTP + X-Forwarded-* / CF-Connecting-IP| W["Waku SSR + Hono API (:3000)"]
+    N -->|HTTP + X-Forwarded-* / resolved client IP| W["Waku SSR + Hono API (:3000)"]
 
     U -->|"Omise.createToken / tokenization[method]=applepay"| V["Omise Vault (vault.omise.co)"]
     V -->|tokn_...| U
@@ -174,9 +174,9 @@ sequenceDiagram
 ## 5. 核心业务、风控与合规设计
 
 ### 5.1 客户与持卡人信息分离设计
-| 维度 | 客户信息 (`customer` / Step 1) | 持卡人支付信息 (`payer` + `billing` / Step 2) |
+| 维度 | 客户信息（`customer` / Step 1） | 持卡人支付信息（`payer` + `billing` / Step 2） |
 | :--- | :--- | :--- |
-| **表单字段** | 客户全名、客户邮箱（接收账单/收据）、金额、币种、账单描述 | 是否第三方卡开关、持卡人姓名、`Same as customer` 快捷填充、可选持卡人邮箱（勾选第三方卡或姓名不一致时自动展开）、可选持卡人国际手机号（3DS 2.0）、卡号/有效期/CVC、AVS 账单地址 |
+| **表单字段** | 客户全名、客户邮箱（接收收据）、Customer 地址、金额、币种、账单描述 | 是否第三方卡开关、持卡人姓名、`Same as customer` 快捷填充、可选持卡人邮箱（勾选第三方卡或姓名不一致时自动展开）、可选持卡人国际手机号（3DS 2.0）、卡号/有效期/CVC、持卡人 AVS 账单地址 |
 | **Omise Customer 归属** | 仅**本人卡**支付时，依据标准化小写邮箱查询缓存/Search API，创建或 PATCH Omise Customer（`metadata` 仅存 `customer_name`、`invoice_number`、`registration_ip`、`last_ip`、`user_agent`，不混入 `billing_*`） | **第三方卡**支付（显式勾选 `is_third_party_card: true` 或 `customerName.toLowerCase() !== cardholderName.toLowerCase()`）完全跳过 Customer 创建与绑定，直接使用一次性 `tokn_...` |
 | **Token 化联系字段** | 本人卡时作为 `Omise.createToken` 的 `email` | 第三方卡时仅使用填写的 `cardholderEmail`（不泄露客户邮箱）；如填写国际手机号，双方均写入 `tokenCardData.phone_number` 与 `metadata.cardholder_phone` |
 
@@ -185,10 +185,12 @@ sequenceDiagram
 | 币种 | 符号 | 金额范围（Subunits） | 支持的信用卡品牌 | Apple Pay 网络 |
 | :--- | :--- | :--- | :--- | :--- |
 | **SGD**（默认） | `S$` | `100` – `2,000,000` (`S$1.00` – `S$20,000.00`) | Visa、Mastercard、**JCB** | `visa`、`masterCard`、`jcb` |
-| **USD** | `$` | `100` – `2,000,000` (`$1.00` – `$20,000.00`) | **仅限 Visa、Mastercard** | `visa`、`masterCard` |
 | **CAD** | `CA$` | `100` – `2,000,000` (`CA$1.00` – `CA$20,000.00`) | **仅限 Visa、Mastercard** | `visa`、`masterCard` |
 
-- **实时参考汇率**：`src/utils/fx-rates.ts` 从 `https://open.er-api.com/v6/latest/SGD` 拉取汇价，成功缓存 **1 小时**，超时/失败回退静态参考汇率（`SGD: 1, USD: 0.745, CAD: 1.035`）并在 **5 分钟**后重试。
+- **实时参考汇率**：`src/utils/fx-rates.ts` 从 `https://open.er-api.com/v6/latest/SGD` 拉取 SGD → CAD 汇价，成功缓存 **1 小时**，超时/失败回退静态参考汇率（`SGD: 1, CAD: 1.035`）并在 **5 分钟**后重试。该汇率只作参考，实际交易金额、Omise 换汇率与发卡行账单汇率可能不同。
+- **CAD 限额注意**：应用当前金额上限是商户侧配置，Omise SG 的多币种交易限额按结算资金与账户设置执行；上线前应以 Omise Dashboard / 账户团队确认的 CAD 限额为准，不能把参考汇率当作授权金额或限额依据。
+- **Omise 请求可靠性**：charge 请求把前端为单次付款生成的 UUID `client_ref` 同时用作 Omise `ref_id`，避免同一请求重试创建重复 charge；本地仍需对同一发票号的独立重复付款做业务级拦截。
+- **风控上下文**：charge 的 `ip` 只取自 Nginx 解析并校验过的实际客户端 IP；不接受请求体里的 IP/UA 作为风控字段。Cloudflare 来源网段要持续更新，避免把边缘节点地址或伪造头传给 Omise。
 - **防跨页参考汇率错乱**：回执页使用与 `chargeResult.amount` 和 `chargeResult.currency` 绑定的 `receiptCurrencyReference` 计算展示，避免 3DS 整页回跳后被重置的表单默认金额（`1500.00 SGD`）污染回执显示。
 
 ### 5.3 订单号、金额精度与卡号校验
@@ -240,7 +242,7 @@ sequenceDiagram
 | :--- | :--- | :--- |
 | `OMISE_PUBLIC_KEY` | **必填** | Omise 公钥（Live `pkey_...` 或 Test `pkey_test_...`），仅用于前端 `Omise.js` 与 Apple Pay Vault Token 化 |
 | `OMISE_SECRET_KEY` | **必填** | Omise 私钥（Live `skey_...` 或 Test `skey_test_...`），仅服务端持有，严禁下发前端 |
-| `OMISE_CURRENCY` | 可选 | 默认币种，支持 `sgd` / `usd` / `cad`，默认 `sgd` |
+| `OMISE_CURRENCY` | 可选 | 默认币种，仅支持 `sgd` / `cad`，默认 `sgd` |
 | `OMISE_WEBHOOK_SECRET` | **生产推荐** | Omise Dashboard Webhooks 获取的签名密钥；配置后服务端严格拒收未验签或验签失败的回调 |
 | `APPLE_MERCHANT_ID` | 可选 | Apple Pay Merchant Identifier（如 `merchant.co.omise.xxx`） |
 | `APPLE_MERCHANT_CERT_PATH` | 可选 | 商户身份证书路径（支持相对或绝对路径，自动回退 `./certs/apcert.pem` 等） |
@@ -315,14 +317,14 @@ npm run start
    - `GET /api/charge/:id` 无鉴权直接返回客户与持卡人姓名/邮箱及卡后四位，建议改用高熵 `crypto.randomUUID()` 令牌或签名回执参数鉴权。
 4. **收紧 `return_uri`、代理 IP 与 Apple Pay URL 白名单**：
    - 限制 `return_uri` 的协议与域名必须属于本站白名单（如 `https://pay.cyberjar.io`），杜绝 3DS 开放重定向；
-   - 若源站未限制仅允许 Cloudflare IP 回源，应移除 `nginx.conf` 对未认证请求头 `$http_cf_connecting_ip` 的透传以及后端 `body.client_ip` 的回退读取，防止伪造风控 IP；
+   - `nginx.conf` 现使用 Cloudflare 公布网段校验来源后才接受 `CF-Connecting-IP`，应用只读取 Nginx 重写后的 `X-Real-IP`，并移除请求体 IP 回退。Cloudflare 网段需定期同步，且生产源站防火墙仍应限制仅 Cloudflare 回源；
    - 收紧 Apple Pay `validationUrl`，增加 `protocol === 'https:'` 及 Apple 官方网关主机白名单正则检查。
 5. **补充 Nginx 安全响应头与 PCI-DSS 合规说明**：
    - 在 `nginx.conf` 配置 `Strict-Transport-Security`、`X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`Referrer-Policy` 以及严格 `Content-Security-Policy`（仅允许 `'self'`、`https://cdn.omise.co`、`https://vault.omise.co` 等必需源）；
    - **合规提示**：当前页面直接托管 `<input>` 收集卡号再调用 `Omise.createToken`，按 PCI SSC 分类属于 **SAQ A-EP**（需遵守 PCI-DSS 4.0 支付页脚本完整性 6.4.3 / 11.6.1 等控制要求）；若后续希望降级为最轻量的 **SAQ A**，可改用 Omise Hosted Payment Page 或 iFrame 托管控件。
 
 ### P2（工程健壮性优化）
-1. **服务端下单幂等性**：对相同 `client_ref` / `invoice_number` 在扣款中或已成功状态拦截重复创建 Charge。
+1. **服务端业务级重复付款保护**：当前 Omise `ref_id` 处理同一次请求重试；服务端仍应对相同 `invoice_number` 在扣款中或已成功状态拦截独立的新 charge。
 2. **固定 `Omise-Version` 请求头**：在访问 `api.omise.co` 时显式声明版本号，防止账号设置升级引起数据结构漂移。
 3. **Apple Pay 细节增强**：将 `ApplePaySession` 的 `total.label` 与后端 `/api/config` 下发的 `APPLE_DISPLAY_NAME` 保持一致，并按需通过 `requiredBillingContactFields` 补充持卡人账单联系信息。
 4. **持久化存储与容器降权**：多实例水平扩展时需将 `data/charge-store.json` 替换为 SQLite / PostgreSQL / Redis；`Dockerfile` 生产运行阶段建议切换至非 root 用户（`USER node`）。

@@ -2,7 +2,6 @@ export interface ExchangeRatesData {
   base: 'SGD';
   rates: {
     SGD: number;
-    USD: number;
     CAD: number;
   };
   source: 'live' | 'fallback';
@@ -11,7 +10,6 @@ export interface ExchangeRatesData {
 
 const FALLBACK_RATES = {
   SGD: 1,
-  USD: 0.745,
   CAD: 1.035,
 };
 
@@ -22,7 +20,7 @@ let cachedData: ExchangeRatesData | null = null;
 let cacheExpiresAt = 0;
 
 /**
- * Fetch live SGD -> USD / CAD exchange rates with in-memory TTL cache and safe fallback.
+ * Fetch the live SGD -> CAD reference rate with in-memory TTL cache and safe fallback.
  */
 export async function getExchangeRates(): Promise<ExchangeRatesData> {
   const now = Date.now();
@@ -41,15 +39,13 @@ export async function getExchangeRates(): Promise<ExchangeRatesData> {
         result?: string;
         rates?: Record<string, unknown>;
       };
-      const usdRate = typeof json?.rates?.USD === 'number' ? json.rates.USD : 0;
       const cadRate = typeof json?.rates?.CAD === 'number' ? json.rates.CAD : 0;
 
-      if (usdRate > 0 && cadRate > 0) {
+      if (cadRate > 0) {
         cachedData = {
           base: 'SGD',
           rates: {
             SGD: 1,
-            USD: Number(usdRate.toFixed(4)),
             CAD: Number(cadRate.toFixed(4)),
           },
           source: 'live',

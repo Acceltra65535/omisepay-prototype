@@ -234,7 +234,6 @@ function getCountryDialCode(countryCode: string): string {
 
 export interface CurrencyReference {
   primary: string;
-  secondary: string;
   text: string;
 }
 
@@ -245,35 +244,15 @@ export function buildCurrencyReference(
 ): CurrencyReference | null {
   if (!Number.isFinite(amountMajor) || amountMajor <= 0) return null;
 
-  const rates = exchangeRates?.rates || { SGD: 1, USD: 0.745, CAD: 1.035 };
-  const rateSourceNote = exchangeRates?.source === 'live' ? 'Live FX' : 'Indicative FX';
-  const fromCode = curr.toUpperCase() as 'SGD' | 'USD' | 'CAD';
-  const fromRate = rates[fromCode] || 1;
-  const convertTo = (target: 'SGD' | 'USD' | 'CAD') =>
-    ((amountMajor / fromRate) * (rates[target] || 1)).toFixed(2);
+  const cadPerSgd = exchangeRates?.rates.CAD || 1.035;
+  const indicative = exchangeRates?.source === 'live' ? 'Indicative market rate' : 'Indicative rate';
+  const reference = curr === 'sgd'
+    ? `≈ CA$${(amountMajor * cadPerSgd).toFixed(2)} CAD`
+    : `≈ S$${(amountMajor / cadPerSgd).toFixed(2)} SGD`;
 
-  const sgdAmt = convertTo('SGD');
-  const usdAmt = convertTo('USD');
-  const cadAmt = convertTo('CAD');
-
-  if (curr === 'sgd') {
-    return {
-      primary: `≈ $${usdAmt} USD`,
-      secondary: `≈ CA$${cadAmt} CAD`,
-      text: `${rateSourceNote}: ~$${usdAmt} USD settled via Singapore Dollar`,
-    };
-  }
-  if (curr === 'usd') {
-    return {
-      primary: `≈ S$${sgdAmt} SGD`,
-      secondary: `≈ CA$${cadAmt} CAD`,
-      text: `≈ S$${sgdAmt} SGD · Billed directly in USD via Omise Singapore Multi-Currency (${rateSourceNote})`,
-    };
-  }
   return {
-    primary: `≈ $${usdAmt} USD`,
-    secondary: `≈ S$${sgdAmt} SGD`,
-    text: `≈ S$${sgdAmt} SGD · Billed directly in CAD via Omise Singapore Multi-Currency (${rateSourceNote})`,
+    primary: reference,
+    text: `${reference} · ${indicative}; Omise and issuer rates may differ`,
   };
 }
 
@@ -422,6 +401,7 @@ function AddressFields({
           Country / Region <span className="text-red-500">*</span>
         </label>
         <select id={`${idPrefix}-country`} value={value.country} onChange={(e) => selectCountry(e.target.value)} className={inputClass('country')} disabled={disabled} autoComplete="country">
+          <option value="">Select country / region…</option>
           <optgroup label="Popular Countries & Regions">
             {POPULAR_COUNTRIES.map((c) => <option key={`payer-pop-${c.code}`} value={c.code}>{c.name} ({c.code})</option>)}
           </optgroup>
@@ -474,9 +454,9 @@ export const PaymentForm = () => {
   const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
 
-  // Payment Currency & Amount (SGD default, plus USD and CAD)
+  // Payment Currency & Amount (SGD default, plus CAD)
   const [currency, setCurrency] = useState<SupportedCurrency>('sgd');
-  const currencyConfig = SUPPORTED_CURRENCIES[currency] || SUPPORTED_CURRENCIES.sgd;
+  const currencyConfig = SUPPORTED_CURRENCIES[currency];
   const [amount, setAmount] = useState('1500.00');
   const [exchangeRates, setExchangeRates] = useState<ExchangeRatesData | null>(null);
 
@@ -490,14 +470,14 @@ export const PaymentForm = () => {
   const [cvc, setCvc] = useState('');
 
   // AVS International Billing Address Fields
-  const [country, setCountry] = useState('US'); // Default to US to highlight US high-value compliance
+  const [country, setCountry] = useState('');
   const [street1, setStreet1] = useState('');
   const [street2, setStreet2] = useState('');
   const [city, setCity] = useState('');
   const [state, setState] = useState('');
   const [postalCode, setPostalCode] = useState('');
   const [customerAddress, setCustomerAddress] = useState({
-    country: 'US', street1: '', street2: '', city: '', state: '', postalCode: '',
+    country: '', street1: '', street2: '', city: '', state: '', postalCode: '',
   });
 
   // UI state & validation
@@ -543,12 +523,6 @@ export const PaymentForm = () => {
   const cardBrand = useMemo(() => getCardBrand(cardNumber), [cardNumber]);
   const maxCvcLength = cardBrand === 'amex' ? 4 : 3;
 
-  // High-value calculation (>= 1,000 in currency, or US/CA card)
-  const isHighValue = useMemo(() => {
-    const amt = parseFloat(amount || '0');
-    return country === 'US' || country === 'CA' || amt >= 1000;
-  }, [amount, country]);
-
   const nameDiffersFromCustomer = Boolean(
     customerName.trim() &&
     cardholderName.trim() &&
@@ -566,7 +540,8 @@ export const PaymentForm = () => {
   const receiptCurrencyReference = useMemo(() => {
     if (!chargeResult || typeof chargeResult.amount !== 'number') return null;
     const rawCurr = (chargeResult.currency || currency).toLowerCase();
-    const resCurr: SupportedCurrency = isSupportedCurrency(rawCurr) ? rawCurr : 'sgd';
+    if (!isSupportedCurrency(rawCurr)) return null;
+    const resCurr: SupportedCurrency = rawCurr;
     return buildCurrencyReference(chargeResult.amount / 100, resCurr, exchangeRates);
   }, [chargeResult, currency, exchangeRates]);
 
@@ -589,8 +564,8 @@ export const PaymentForm = () => {
           setExchangeRates(config.exchangeRates);
         }
 
-        if (config.defaultCurrency && ['sgd', 'usd', 'cad'].includes(config.defaultCurrency.toLowerCase())) {
-          setCurrency(config.defaultCurrency.toLowerCase() as SupportedCurrency);
+        if (typeof config.defaultCurrency === 'string' && isSupportedCurrency(config.defaultCurrency)) {
+          setCurrency(config.defaultCurrency.toLowerCase());
         }
 
         if (!config.isConfigured) {
@@ -913,7 +888,6 @@ export const PaymentForm = () => {
       customerName,
       customerEmail,
       country,
-      isHighValue,
       invoiceNumber,
       cardholderName,
       cardholderEmail,
@@ -1056,7 +1030,7 @@ export const PaymentForm = () => {
             });
 
             setStatus('charging');
-            const clientRef = 'om_ref_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+            const clientRef = `om_ref_${window.crypto.randomUUID()}`;
             const returnUri = window.location.origin + window.location.pathname + '?ref=' + clientRef;
             const applePayNetwork = String(event.payment.token.paymentMethod?.network || '').toLowerCase();
 
@@ -1255,8 +1229,7 @@ export const PaymentForm = () => {
           throw new Error('Enter a valid payment amount with up to 2 decimal places.');
         }
 
-        const clientRef =
-          'om_ref_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+        const clientRef = `om_ref_${window.crypto.randomUUID()}`;
         const returnUri =
           window.location.origin + window.location.pathname + '?ref=' + clientRef;
 
@@ -1577,16 +1550,20 @@ if (status === 'success' && chargeResult) {
         {/* Amount Summary */}
         {(() => {
           const rawCurr = (chargeResult.currency || currency).toLowerCase();
-          const resCurr: SupportedCurrency = isSupportedCurrency(rawCurr) ? rawCurr : 'sgd';
-          const resCfg = SUPPORTED_CURRENCIES[resCurr] || SUPPORTED_CURRENCIES.sgd;
+          const resCurr = isSupportedCurrency(rawCurr) ? rawCurr : null;
+          const resCfg = resCurr ? SUPPORTED_CURRENCIES[resCurr] : null;
           return (
             <div className="mb-6 rounded-xl bg-slate-50 p-4 border border-slate-100">
               <span className="text-xs uppercase font-semibold text-slate-400">Total Amount Paid</span>
               <div className="mt-1 flex items-baseline gap-2">
                 <span className="text-3xl font-extrabold text-slate-900">
-                  {resCfg.symbol}{(chargeResult.amount / 100).toFixed(2)}
+                  {resCfg
+                    ? `${resCfg.symbol}${(chargeResult.amount / 100).toFixed(2)}`
+                    : `${(chargeResult.amount / 100).toFixed(2)} ${rawCurr.toUpperCase()}`}
                 </span>
-                <span className="text-sm font-semibold text-slate-500">{resCfg.code.toUpperCase()}</span>
+                {resCfg && (
+                  <span className="text-sm font-semibold text-slate-500">{resCfg.code.toUpperCase()}</span>
+                )}
               </div>
               {receiptCurrencyReference && (
                 <p className="mt-1 text-xs text-slate-500">
@@ -1801,11 +1778,11 @@ return (
             <span>💳</span> Payment Currency
           </span>
           <span className="text-xs font-medium text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-100">
-            Multi-Currency (SGD · USD · CAD)
+            Multi-Currency (SGD · CAD)
           </span>
         </div>
-        <div className="grid grid-cols-3 gap-2.5">
-          {(['sgd', 'usd', 'cad'] as const).map((curr) => {
+        <div className="grid grid-cols-2 gap-2.5">
+          {(['sgd', 'cad'] as const).map((curr) => {
             const cfg = SUPPORTED_CURRENCIES[curr];
             const isSelected = currency === curr;
             return (
@@ -1836,23 +1813,6 @@ return (
           })}
         </div>
       </div>
-
-      {/* High-Value Anti-Fraud Compliance Shield */}
-      {isHighValue && (
-        <div className="mb-6 rounded-xl border border-indigo-200 bg-gradient-to-r from-indigo-50/90 via-blue-50/70 to-slate-50 p-4 text-xs text-indigo-950 shadow-sm">
-          <div className="flex items-start gap-3">
-            <span className="text-xl">🏛️</span>
-            <div className="space-y-1">
-              <span className="font-bold text-indigo-900">
-                High-Value Transaction Anti-Fraud Shield
-              </span>
-              <p className="text-slate-600 leading-relaxed">
-                In compliance with international card network (Visa / Mastercard / JCB) standards, Customer order identity and Cardholder AVS billing verification are kept strictly separated with Level 2 Invoice metadata and mandatory 3D Secure 2.0. This maximizes approval rates even when paying with a third-party card.
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
 
       <form onSubmit={handleSubmit} className="space-y-6">
         {/* ═══════════════════════════════════════════════ */}
@@ -2374,7 +2334,7 @@ return (
               {/* Country Selection */}
               <div>
                 <label htmlFor="country" className="mb-1.5 block text-sm font-medium text-slate-700">
-                  Country / Region of Card Issuance <span className="text-red-500">*</span>
+                  Cardholder Billing Country / Region <span className="text-red-500">*</span>
                 </label>
                 <select
                   id="country"
@@ -2387,6 +2347,7 @@ return (
                   disabled={isProcessing}
                   autoComplete="country"
                 >
+                  <option value="">Select country / region…</option>
                   <optgroup label="Popular Countries & Regions">
                     {POPULAR_COUNTRIES.map((c) => (
                       <option key={`pop_${c.code}`} value={c.code}>
@@ -2662,12 +2623,11 @@ return (
             <svg className="h-3.5 w-3.5 text-indigo-500" fill="currentColor" viewBox="0 0 20 20">
               <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
             </svg>
-            Strict AVS Verification
+            AVS Address Format Checks
           </span>
           <span>·</span>
           <span>3D Secure 2.0</span>
           <span>·</span>
-          <span>Level 2 Invoicing Data</span>
         </div>
       </form>
     </div>

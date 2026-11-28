@@ -44,7 +44,7 @@ export default async function HomePage() {
         <a href="https://www.omise.co" target="_blank" rel="noreferrer" className="text-indigo-600 underline">
           Omise
         </a>
-        {' '}supporting Singapore Dollar (SGD), US Dollar (USD), and Canadian Dollar (CAD).
+        {' '}supporting Singapore Dollar (SGD) and Canadian Dollar (CAD).
       </p>
       <div className="mt-6 flex flex-wrap gap-3">
         <Link
@@ -61,7 +61,7 @@ export default async function HomePage() {
         <div className="mt-8 space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
           <div className="font-bold">Omise Keys Not Configured · Multi-Currency</div>
           <p>
-            Configure OMISE_PUBLIC_KEY and OMISE_SECRET_KEY in .env to enable SGD, USD, and CAD checkout.
+            Configure OMISE_PUBLIC_KEY and OMISE_SECRET_KEY in .env to enable SGD and CAD checkout.
           </p>
         </div>
       ) : isLive ? (
@@ -74,14 +74,14 @@ export default async function HomePage() {
             Production Mode (Live) · Multi-Currency
           </div>
           <p>
-            Ready for live SGD, USD, and CAD card &amp; Apple Pay processing with 3D Secure 2.0 via Omise Singapore.
+            Ready for live SGD and CAD card &amp; Apple Pay processing with 3D Secure 2.0 via Omise Singapore.
           </p>
         </div>
       ) : (
         <div className="mt-8 space-y-2 rounded-xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-800">
           <div className="font-bold">Test Mode (Sandbox) · Multi-Currency</div>
           <p>
-            Connected with Omise test keys for SGD, USD, and CAD card &amp; Apple Pay testing with 3D Secure 2.0.
+            Connected with Omise test keys for SGD and CAD card &amp; Apple Pay testing with 3D Secure 2.0.
           </p>
         </div>
       )}

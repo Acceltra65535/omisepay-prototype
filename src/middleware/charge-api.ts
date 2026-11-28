@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { MiddlewareHandler } from 'hono';
@@ -92,26 +93,13 @@ function getAuthHeader(secretKey: string): string {
 }
 
 /**
- * Extract real client IP address from proxy headers (Cloudflare, Nginx, ALB)
+ * Read the client IP that Nginx resolved from the socket and trusted proxy chain.
  * Essential for 3D Secure 2.0 ACS and Visa/Mastercard fraud risk scoring.
  */
 function getClientIp(c: any): string {
-  const cfIp = c.req.header('cf-connecting-ip');
-  if (cfIp) return cfIp.trim();
-
   const realIp = c.req.header('x-real-ip');
-  if (realIp) return realIp.trim();
-
-  const forwardedFor = c.req.header('x-forwarded-for');
-  if (forwardedFor) {
-    const firstIp = forwardedFor.split(',')[0]?.trim();
-    if (firstIp) return firstIp;
-  }
-
-  const trueClientIp = c.req.header('true-client-ip');
-  if (trueClientIp) return trueClientIp.trim();
-
-  return '';
+  const normalizedIp = realIp?.trim() || '';
+  return isIP(normalizedIp) ? normalizedIp : '';
 }
 
 function getClientUserAgent(c: any): string {
@@ -1118,11 +1106,20 @@ const chargeApi = (): MiddlewareHandler => {
           return c.json({ error: 'Missing or invalid card token' }, 400);
         }
         const defaultCurr = getDefaultCurrency();
-        const normalizedCurrency = typeof currency === 'string' ? currency.toLowerCase().trim() : defaultCurr;
-        const finalCurrency: SupportedCurrency = isSupportedCurrency(normalizedCurrency)
-          ? normalizedCurrency
-          : defaultCurr;
-        const currencyConfig = SUPPORTED_CURRENCIES[finalCurrency] || SUPPORTED_CURRENCIES.sgd;
+        if (currency !== undefined && (typeof currency !== 'string' || !isSupportedCurrency(currency))) {
+          return c.json(
+            { error: 'Unsupported currency. Use SGD or CAD.', code: 'unsupported_currency' },
+            400,
+          );
+        }
+        const finalCurrency: SupportedCurrency = currency === undefined
+          ? defaultCurr
+          : currency.toLowerCase().trim();
+        const currencyConfig = SUPPORTED_CURRENCIES[finalCurrency];
+
+        if (typeof client_ref !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(client_ref)) {
+          return c.json({ error: 'Missing or invalid payment reference' }, 400);
+        }
         const currencySymbol = currencyConfig.symbol;
 
         if (typeof amount !== 'number' || !Number.isSafeInteger(amount)) {
@@ -1144,7 +1141,7 @@ const chargeApi = (): MiddlewareHandler => {
           );
         }
 
-        // Cross-currency card brand guard (USD/CAD Multi-Currency supports Visa & Mastercard only)
+        // CAD Multi-Currency supports Visa & Mastercard only.
         if (typeof card_brand === 'string' && card_brand.trim()) {
           const cleanBrand = card_brand.trim().toLowerCase();
           if (!isCardBrandSupportedForCurrency(cleanBrand, finalCurrency)) {
@@ -1188,8 +1185,8 @@ const chargeApi = (): MiddlewareHandler => {
         }
 
         // Extract Cardholder IP & Browser Context (3DS 2.0 browserIP)
-        const clientIp = getClientIp(c) || (body.client_ip ? String(body.client_ip).trim() : '');
-        const userAgent = getClientUserAgent(c) || (body.user_agent ? String(body.user_agent).trim() : '');
+        const clientIp = getClientIp(c);
+        const userAgent = getClientUserAgent(c);
         const acceptLanguage = getClientAcceptLanguage(c);
 
         // Step 1: Resolve or Create Customer Entity (strictly for the customer, never binding third-party cards)
@@ -1271,9 +1268,6 @@ const chargeApi = (): MiddlewareHandler => {
         }
 
         // Step 2: Create Charge with mandatory return_uri & separated Customer / Cardholder context
-        const isUsOrHighValue =
-          billing?.country === 'US' || billing?.country === 'CA' || amount >= 100000;
-
         // Enforce 3DS on standard cards via pre-authorization (capture: false):
         // funds are only captured if Omise confirms authenticated_by is '3DS' or 'PASSKEY';
         // otherwise the authorization hold is automatically reversed.
@@ -1286,6 +1280,7 @@ const chargeApi = (): MiddlewareHandler => {
         const chargePayload: Record<string, any> = {
           amount: amount,
           currency: finalCurrency,
+          ref_id: client_ref,
           return_uri: finalReturnUri,
           capture: shouldEnforceManualCapture3DS ? false : true,
           description: invoiceDesc,
@@ -1318,7 +1313,6 @@ const chargeApi = (): MiddlewareHandler => {
             client_ip: clientIp,
             user_agent: userAgent,
             accept_language: acceptLanguage,
-            high_value_us_compliance: isUsOrHighValue,
           },
         };
 

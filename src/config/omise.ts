@@ -1,4 +1,5 @@
-export type SupportedCurrency = 'sgd' | 'usd' | 'cad';
+export const SUPPORTED_CURRENCY_CODES = ['sgd', 'cad'] as const;
+export type SupportedCurrency = typeof SUPPORTED_CURRENCY_CODES[number];
 export type CardBrand = 'visa' | 'mastercard' | 'jcb';
 
 export interface CurrencyConfig {
@@ -31,20 +32,6 @@ export const SUPPORTED_CURRENCIES: Record<SupportedCurrency, CurrencyConfig> = {
     applePayNetworks: ['visa', 'masterCard', 'jcb'],
     supportedBrandsLabel: 'Visa, Mastercard, JCB',
   },
-  usd: {
-    code: 'usd',
-    symbol: '$',
-    label: 'USD ($)',
-    name: 'US Dollar',
-    flag: '🇺🇸',
-    countryCode: 'SG',     // Processed via Omise SG account
-    minSubunits: 100,      // 最低 $1.00
-    maxSubunits: 2000000,  // 最高 $20,000.00
-    defaultAmount: '1000.00',
-    supportedBrands: ['visa', 'mastercard'],
-    applePayNetworks: ['visa', 'masterCard'],
-    supportedBrandsLabel: 'Visa, Mastercard',
-  },
   cad: {
     code: 'cad',
     symbol: 'CA$',
@@ -62,7 +49,8 @@ export const SUPPORTED_CURRENCIES: Record<SupportedCurrency, CurrencyConfig> = {
 };
 
 export function isSupportedCurrency(value: string): value is SupportedCurrency {
-  return ['sgd', 'usd', 'cad'].includes(value.toLowerCase().trim());
+  const normalized = value.toLowerCase().trim();
+  return SUPPORTED_CURRENCY_CODES.some((currency) => currency === normalized);
 }
 
 export function isCardBrandSupportedForCurrency(
@@ -70,7 +58,7 @@ export function isCardBrandSupportedForCurrency(
   currency: SupportedCurrency,
 ): boolean {
   const normalizedBrand = brand.toLowerCase().trim();
-  const cfg = SUPPORTED_CURRENCIES[currency] || SUPPORTED_CURRENCIES.sgd;
+  const cfg = SUPPORTED_CURRENCIES[currency];
   return (cfg.supportedBrands as readonly string[]).includes(normalizedBrand);
 }
 
@@ -86,10 +74,10 @@ export const OMISE_CONFIG = {
   // Omise Live Secret Key (仅用于后端 Hono 中间件发起扣款与查询，绝不暴露至前端)
   secretKey: process.env.OMISE_SECRET_KEY || 'OMISE_SECRET_KEY_PLACEHOLDER',
 
-  // 默认货币：优先读取 .env 中的 OMISE_CURRENCY，默认为 sgd，支持 sgd, usd, cad
+  // 默认货币：优先读取 .env 中的 OMISE_CURRENCY，默认为 sgd，支持 sgd、cad
   currency: resolveDefaultCurrency(),
   defaultCurrency: resolveDefaultCurrency(),
-  supportedCurrencies: ['sgd', 'usd', 'cad'] as const,
+  supportedCurrencies: SUPPORTED_CURRENCY_CODES,
 
   // 交易限额设置（单位：subunit / 分，1 单位 = 100 subunits）
   minAmountSubunits: 100,      // 最低 1.00

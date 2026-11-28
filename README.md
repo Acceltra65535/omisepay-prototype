@@ -11,11 +11,11 @@ This repository demonstrates a minimal, end-to-end integration for processing cr
 
 ## Features
 
-- **Multi-Currency Support**: Native support for **SGD (S$)**, **USD ($)**, and **CAD (CA$)** via Omise Multi-Currency gateway.
-- **Apple Pay & Credit Cards**: Seamless processing for Apple Pay and international Visa, Mastercard, American Express, and Discover cards.
+- **Multi-Currency Support**: Support for **SGD (S$)** and **CAD (CA$)** via Omise Singapore.
+- **Apple Pay & Credit Cards**: Apple Pay plus Visa and Mastercard for SGD/CAD; JCB is available for SGD.
 - **3-D Secure 2.0 Ready**: Built-in automated 3DS verification and callback handling.
-- **Strict International AVS & Anti-Fraud**: Verified Address Verification System (AVS) supporting US, Canada, UK, Australia, Singapore, and worldwide territories.
-- **Customer & Invoice Entity**: Level 2 / Level 3 metadata passing for high-value authorization success.
+- **International AVS Address Checks**: Country-aware formatting and validation for cardholder billing addresses; the issuer determines the AVS result.
+- **Separated Customer & Cardholder Data**: Customer, cardholder, and invoice details are sent in their appropriate Omise request fields.
 
 ## Quick Start
 

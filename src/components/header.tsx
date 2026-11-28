@@ -9,7 +9,7 @@ export const Header = () => {
         </Link>
       </h2>
       <span className="hidden sm:inline-flex items-center gap-1.5 rounded-full bg-indigo-50 px-2.5 py-0.5 text-xs font-semibold text-indigo-700 border border-indigo-100">
-        SGD · USD · CAD
+        SGD · CAD
       </span>
       <nav className="flex items-center gap-3">
         <Link
